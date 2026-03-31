@@ -18,6 +18,7 @@ fn main_menu(config: &Config) -> Result<()> {
             vec![
                 "Browse & download photoshoots",
                 "Sync all photos to B2",
+                "Generate missing previews",
                 "Lightroom library sync",
                 "Quit",
             ],
@@ -35,6 +36,11 @@ fn main_menu(config: &Config) -> Result<()> {
                     eprintln!("Error: {e}");
                 } else {
                     println!("Sync complete.");
+                }
+            }
+            "Generate missing previews" => {
+                if let Err(e) = generate_missing_previews(config) {
+                    eprintln!("Error: {e}");
                 }
             }
             "Lightroom library sync" => {
@@ -211,6 +217,48 @@ fn edit_metadata(shoot: &b2::Shoot) -> Result<b2::Metadata> {
     println!("Metadata saved.");
 
     Ok(metadata)
+}
+
+fn generate_missing_previews(config: &Config) -> Result<()> {
+    println!("Fetching shoot list...");
+    let shoots = b2::list_shoots(config)?;
+
+    if shoots.is_empty() {
+        println!("No photoshoots found.");
+        return Ok(());
+    }
+
+    // Check which shoots are missing previews and have local files to generate from
+    println!("Checking for missing previews...");
+    let missing: Vec<&b2::Shoot> = shoots
+        .iter()
+        .filter(|s| {
+            let has_local = s.local_path(config).exists();
+            let has_previews = b2::previews_exist(s);
+            has_local && !has_previews
+        })
+        .collect();
+
+    if missing.is_empty() {
+        println!("All locally available shoots already have previews.");
+        return Ok(());
+    }
+
+    println!("{} shoot(s) need previews:", missing.len());
+    for s in &missing {
+        println!("  {}", s.name);
+    }
+
+    for (i, shoot) in missing.iter().enumerate() {
+        println!("\n[{}/{}] {}", i + 1, missing.len(), shoot.name);
+        match b2::generate_and_upload_previews(shoot, config) {
+            Ok(_) => println!("Previews uploaded."),
+            Err(e) => eprintln!("  Failed: {e}"),
+        }
+    }
+
+    println!("\nDone.");
+    Ok(())
 }
 
 fn lightroom_menu(config: &Config) -> Result<()> {

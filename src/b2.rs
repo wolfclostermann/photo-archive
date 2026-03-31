@@ -255,6 +255,16 @@ pub fn generate_and_upload_previews(shoot: &Shoot, config: &Config) -> Result<()
     Ok(())
 }
 
+pub fn previews_exist(shoot: &Shoot) -> bool {
+    Command::new("rclone")
+        .args(["ls", &shoot.previews_remote()])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .output()
+        .map(|o| !o.stdout.is_empty())
+        .unwrap_or(false)
+}
+
 /// Downloads previews from B2 to a local temp directory and opens it in Finder.
 pub fn browse_previews(shoot: &Shoot) -> Result<()> {
     // Check previews exist on B2
