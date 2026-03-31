@@ -19,6 +19,7 @@ fn main_menu(config: &Config) -> Result<()> {
                 "Browse & download photoshoots",
                 "Sync all photos to B2",
                 "Generate missing previews",
+                "Purge local copies",
                 "Lightroom library sync",
                 "Quit",
             ],
@@ -40,6 +41,11 @@ fn main_menu(config: &Config) -> Result<()> {
             }
             "Generate missing previews" => {
                 if let Err(e) = generate_missing_previews(config) {
+                    eprintln!("Error: {e}");
+                }
+            }
+            "Purge local copies" => {
+                if let Err(e) = purge_local_menu(config) {
                     eprintln!("Error: {e}");
                 }
             }
@@ -129,6 +135,7 @@ fn shoot_menu(config: &Config, shoot: &b2::Shoot) -> Result<Option<b2::Metadata>
                 "Download",
                 "View previews",
                 "Generate previews",
+                "Purge local copy",
                 "Edit metadata",
                 "← Back",
             ],
@@ -150,6 +157,11 @@ fn shoot_menu(config: &Config, shoot: &b2::Shoot) -> Result<Option<b2::Metadata>
                 match b2::generate_and_upload_previews(shoot, config) {
                     Ok(_) => println!("Previews uploaded."),
                     Err(e) => eprintln!("Error: {e}"),
+                }
+            }
+            "Purge local copy" => {
+                if let Err(e) = purge_single(config, shoot) {
+                    eprintln!("Error: {e}");
                 }
             }
             "Edit metadata" => {
@@ -261,6 +273,110 @@ fn generate_missing_previews(config: &Config) -> Result<()> {
     }
 
     println!("\nDone.");
+    Ok(())
+}
+
+fn purge_single(config: &Config, shoot: &b2::Shoot) -> Result<()> {
+    let local = shoot.local_path(config);
+    if !local.exists() {
+        println!("  {} is not downloaded locally.", shoot.name);
+        return Ok(());
+    }
+
+    println!("  Verifying {} is fully synced to B2...", shoot.name);
+    match b2::verify_local_synced(shoot, config) {
+        Ok(true) => {}
+        Ok(false) => {
+            anyhow::bail!("local copy is not fully synced to B2 — upload it first before purging");
+        }
+        Err(e) => {
+            anyhow::bail!("sync check failed: {e}");
+        }
+    }
+
+    println!("  Verified. Local path: {}", local.display());
+    let confirm = Confirm::new("Delete local copy? This cannot be undone.")
+        .with_default(false)
+        .prompt()?;
+
+    if confirm {
+        b2::purge_local(shoot, config)?;
+        println!("  Deleted.");
+    }
+    Ok(())
+}
+
+fn purge_local_menu(config: &Config) -> Result<()> {
+    println!("Fetching shoot list...");
+    let shoots = b2::list_shoots(config)?;
+
+    let local_shoots: Vec<&b2::Shoot> = shoots
+        .iter()
+        .filter(|s| s.local_path(config).exists())
+        .collect();
+
+    if local_shoots.is_empty() {
+        println!("No shoots are downloaded locally.");
+        return Ok(());
+    }
+
+    println!("Verifying {} local shoot(s) against B2...", local_shoots.len());
+
+    let mut synced: Vec<&b2::Shoot> = vec![];
+    let mut skipped = 0usize;
+
+    for shoot in &local_shoots {
+        print!("  {} ... ", shoot.name);
+        let _ = std::io::Write::flush(&mut std::io::stdout());
+        match b2::verify_local_synced(shoot, config) {
+            Ok(true) => {
+                println!("synced");
+                synced.push(shoot);
+            }
+            Ok(false) => {
+                println!("NOT fully synced — skipping");
+                skipped += 1;
+            }
+            Err(e) => {
+                println!("check failed ({e}) — skipping");
+                skipped += 1;
+            }
+        }
+    }
+
+    if synced.is_empty() {
+        println!("\nNo fully-synced local shoots to purge.");
+        return Ok(());
+    }
+
+    println!("\nThe following {} shoot(s) are fully synced to B2:", synced.len());
+    for s in &synced {
+        println!("  {}", s.name);
+    }
+    if skipped > 0 {
+        println!("  ({skipped} shoot(s) not fully synced will be left untouched)");
+    }
+
+    let confirm = Confirm::new(&format!(
+        "Permanently delete {} local shoot(s)? This cannot be undone.",
+        synced.len()
+    ))
+    .with_default(false)
+    .prompt()?;
+
+    if !confirm {
+        return Ok(());
+    }
+
+    for shoot in &synced {
+        print!("  Deleting {} ... ", shoot.name);
+        match b2::purge_local(shoot, config) {
+            Ok(_) => println!("done"),
+            Err(e) => println!("FAILED: {e}"),
+        }
+    }
+
+    println!("Purge complete.");
     Ok(())
 }
 

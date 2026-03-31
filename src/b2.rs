@@ -322,6 +322,51 @@ pub fn browse_previews(shoot: &Shoot) -> Result<()> {
     Ok(())
 }
 
+/// Verifies that every local file in the shoot exists on B2 with a matching checksum.
+/// Uses --one-way so we check local→B2 only. B2 is never written to or deleted from here.
+pub fn verify_local_synced(shoot: &Shoot, config: &Config) -> Result<bool> {
+    let local = shoot.local_path(config);
+    if !local.exists() {
+        return Ok(false);
+    }
+
+    let output = Command::new("rclone")
+        .args([
+            "check",
+            local.to_str().unwrap(),
+            &shoot.remote_path,
+            "--one-way",
+            "--exclude", "shoot.json",
+            "--exclude", "previews/**",
+        ])
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .output()
+        .context("failed to run rclone check")?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        // Surface any meaningful error lines (rclone prints differences to stderr)
+        let errors: Vec<&str> = stderr
+            .lines()
+            .filter(|l| l.contains("ERROR") || l.contains("not found"))
+            .collect();
+        if !errors.is_empty() {
+            anyhow::bail!("{}", errors.join("\n"));
+        }
+        return Ok(false);
+    }
+
+    Ok(true)
+}
+
+/// Deletes the local copy of a shoot using the filesystem only. No rclone involved.
+pub fn purge_local(shoot: &Shoot, config: &Config) -> Result<()> {
+    let local = shoot.local_path(config);
+    std::fs::remove_dir_all(&local)
+        .with_context(|| format!("failed to delete {}", local.display()))
+}
+
 pub enum LocalStatus {
     NotDownloaded,
     Synced,
