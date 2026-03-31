@@ -1,5 +1,6 @@
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::process::{Command, Stdio};
 
 use crate::config::Config;
@@ -57,6 +58,10 @@ impl Shoot {
 
     pub fn local_path(&self, config: &Config) -> std::path::PathBuf {
         config.local_pictures.join(&self.year).join(&self.name)
+    }
+
+    pub fn previews_remote(&self) -> String {
+        format!("{}/previews", self.remote_path)
     }
 }
 
@@ -165,6 +170,133 @@ pub fn save_metadata(remote_path: &str, metadata: &Metadata) -> Result<()> {
     Ok(())
 }
 
+/// Generates JPEG previews from local shoot files and uploads them to B2.
+/// Prefers JPEG source over CR2 for the same filename stem to avoid RAW decode overhead.
+pub fn generate_and_upload_previews(shoot: &Shoot, config: &Config) -> Result<()> {
+    let local = shoot.local_path(config);
+    if !local.exists() {
+        anyhow::bail!("shoot is not downloaded locally — download it first");
+    }
+
+    let preview_dir = std::env::temp_dir()
+        .join("photo-archive-previews")
+        .join(&shoot.name);
+    std::fs::create_dir_all(&preview_dir)?;
+
+    // Collect source files, preferring JPEG over CR2 per stem
+    let mut sources: HashMap<String, std::path::PathBuf> = HashMap::new();
+    for entry in std::fs::read_dir(&local)? {
+        let entry = entry?;
+        let path = entry.path();
+        if !path.is_file() { continue; }
+        let ext = path.extension()
+            .and_then(|e| e.to_str())
+            .unwrap_or("")
+            .to_lowercase();
+        if !matches!(ext.as_str(), "cr2" | "jpg" | "jpeg") { continue; }
+        let stem = path.file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("")
+            .to_string();
+        let is_jpeg = matches!(ext.as_str(), "jpg" | "jpeg");
+        // Insert if not present, or upgrade CR2 entry to JPEG
+        if is_jpeg || !sources.contains_key(&stem) {
+            sources.insert(stem, path);
+        }
+    }
+
+    if sources.is_empty() {
+        anyhow::bail!("no CR2 or JPEG files found in {}", local.display());
+    }
+
+    let total = sources.len();
+    println!("Generating {} previews...", total);
+
+    let mut generated = 0usize;
+    for (stem, src) in &sources {
+        let out = preview_dir.join(format!("{}.jpg", stem));
+        print!("\r  {}/{}", generated + 1, total);
+        let _ = std::io::Write::flush(&mut std::io::stdout());
+
+        let status = Command::new("sips")
+            .args([
+                "-s", "format", "jpeg",
+                "-s", "formatOptions", "65",
+                "--resampleLongEdge", "1024",
+                src.to_str().unwrap(),
+                "--out", out.to_str().unwrap(),
+            ])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .context("failed to run sips — is it available?")?;
+
+        if status.success() { generated += 1; }
+    }
+    println!("\r  {}/{} done", generated, total);
+
+    // Upload previews to B2
+    println!("Uploading previews to B2...");
+    let status = Command::new("rclone")
+        .args([
+            "copy",
+            preview_dir.to_str().unwrap(),
+            &shoot.previews_remote(),
+            "--progress",
+            "--transfers", "4",
+        ])
+        .status()
+        .context("failed to run rclone")?;
+
+    if !status.success() {
+        anyhow::bail!("failed to upload previews");
+    }
+
+    Ok(())
+}
+
+/// Downloads previews from B2 to a local temp directory and opens it in Finder.
+pub fn browse_previews(shoot: &Shoot) -> Result<()> {
+    // Check previews exist on B2
+    let check = Command::new("rclone")
+        .args(["ls", &shoot.previews_remote()])
+        .stderr(Stdio::null())
+        .output()
+        .context("failed to run rclone ls")?;
+
+    if check.stdout.is_empty() {
+        anyhow::bail!("no previews found for this shoot — generate them first");
+    }
+
+    let preview_dir = std::env::temp_dir()
+        .join("photo-archive-previews")
+        .join(&shoot.name);
+    std::fs::create_dir_all(&preview_dir)?;
+
+    println!("Downloading previews...");
+    let status = Command::new("rclone")
+        .args([
+            "copy",
+            &shoot.previews_remote(),
+            preview_dir.to_str().unwrap(),
+            "--progress",
+            "--transfers", "4",
+        ])
+        .status()
+        .context("failed to run rclone")?;
+
+    if !status.success() {
+        anyhow::bail!("failed to download previews");
+    }
+
+    Command::new("open")
+        .arg(preview_dir.to_str().unwrap())
+        .spawn()
+        .context("failed to open Finder")?;
+
+    Ok(())
+}
+
 pub enum LocalStatus {
     NotDownloaded,
     Synced,
@@ -210,12 +342,10 @@ pub fn download_shoot(shoot: &Shoot, config: &Config, filter: DownloadFilter) ->
         shoot.remote_path.clone(),
         local_str,
         "--progress".to_string(),
-        "--transfers".to_string(),
-        "4".to_string(),
-        "--b2-chunk-size".to_string(),
-        "96M".to_string(),
-        "--exclude".to_string(),
-        "shoot.json".to_string(),
+        "--transfers".to_string(), "4".to_string(),
+        "--b2-chunk-size".to_string(), "96M".to_string(),
+        "--exclude".to_string(), "shoot.json".to_string(),
+        "--exclude".to_string(), "previews/**".to_string(),
     ];
 
     match filter {
@@ -251,10 +381,8 @@ pub fn sync_photos_up(config: &Config) -> Result<()> {
             config.local_pictures.to_str().unwrap(),
             &config.pictures_remote,
             "--progress",
-            "--transfers",
-            "4",
-            "--b2-chunk-size",
-            "96M",
+            "--transfers", "4",
+            "--b2-chunk-size", "96M",
         ])
         .status()
         .context("failed to run rclone")?;
@@ -272,8 +400,7 @@ pub fn sync_lightroom_up(config: &Config) -> Result<()> {
             config.local_lightroom.to_str().unwrap(),
             &config.lightroom_remote,
             "--progress",
-            "--transfers",
-            "4",
+            "--transfers", "4",
         ])
         .status()
         .context("failed to run rclone")?;
@@ -291,8 +418,7 @@ pub fn sync_lightroom_down(config: &Config) -> Result<()> {
             &config.lightroom_remote,
             config.local_lightroom.to_str().unwrap(),
             "--progress",
-            "--transfers",
-            "4",
+            "--transfers", "4",
         ])
         .status()
         .context("failed to run rclone")?;

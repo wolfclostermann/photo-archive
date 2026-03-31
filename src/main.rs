@@ -122,11 +122,23 @@ fn shoot_menu(config: &Config, shoot: &b2::Shoot) -> Result<Option<b2::Metadata>
         if !proceed {
             let choice = Select::new(
                 "Options:",
-                vec!["Edit metadata", "← Back"],
+                vec!["Generate & upload previews", "Browse previews", "Edit metadata", "← Back"],
             )
             .prompt()?;
-            if choice == "Edit metadata" {
-                return edit_metadata(shoot).map(Some);
+            match choice {
+                "Generate & upload previews" => {
+                    match b2::generate_and_upload_previews(shoot, config) {
+                        Ok(_) => println!("Previews uploaded."),
+                        Err(e) => eprintln!("Error: {e}"),
+                    }
+                }
+                "Browse previews" => {
+                    if let Err(e) = b2::browse_previews(shoot) {
+                        eprintln!("Error: {e}");
+                    }
+                }
+                "Edit metadata" => return edit_metadata(shoot).map(Some),
+                _ => {}
             }
             return Ok(None);
         }
@@ -138,6 +150,8 @@ fn shoot_menu(config: &Config, shoot: &b2::Shoot) -> Result<Option<b2::Metadata>
             "Download RAW only (.CR2)",
             "Download JPEG only (.jpg)",
             "Download both",
+            "Generate & upload previews",
+            "Browse previews",
             "Edit metadata",
             "← Back",
         ],
@@ -145,6 +159,19 @@ fn shoot_menu(config: &Config, shoot: &b2::Shoot) -> Result<Option<b2::Metadata>
     .prompt()?;
 
     match choice {
+        "Generate & upload previews" => {
+            match b2::generate_and_upload_previews(shoot, config) {
+                Ok(_) => println!("Previews uploaded."),
+                Err(e) => eprintln!("Error: {e}"),
+            }
+            return Ok(None);
+        }
+        "Browse previews" => {
+            if let Err(e) = b2::browse_previews(shoot) {
+                eprintln!("Error: {e}");
+            }
+            return Ok(None);
+        }
         "Edit metadata" => return edit_metadata(shoot).map(Some),
         "← Back" => return Ok(None),
         _ => {}
