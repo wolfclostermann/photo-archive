@@ -213,27 +213,42 @@ pub fn generate_and_upload_previews(shoot: &Shoot, config: &Config) -> Result<()
     println!("Generating {} previews...", total);
 
     let mut generated = 0usize;
+    let mut first_error: Option<String> = None;
+
     for (stem, src) in &sources {
         let out = preview_dir.join(format!("{}.jpg", stem));
         print!("\r  {}/{}", generated + 1, total);
         let _ = std::io::Write::flush(&mut std::io::stdout());
 
-        let status = Command::new("sips")
+        let result = Command::new("/usr/bin/sips")
             .args([
                 "-s", "format", "jpeg",
-                "-s", "formatOptions", "65",
                 "--resampleLongEdge", "1024",
                 src.to_str().unwrap(),
                 "--out", out.to_str().unwrap(),
             ])
             .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()
-            .context("failed to run sips — is it available?")?;
+            .stderr(Stdio::piped())
+            .output()
+            .context("failed to run sips")?;
 
-        if status.success() { generated += 1; }
+        if result.status.success() {
+            generated += 1;
+        } else if first_error.is_none() {
+            first_error = Some(String::from_utf8_lossy(&result.stderr).trim().to_string());
+        }
     }
     println!("\r  {}/{} done", generated, total);
+
+    if generated == 0 {
+        let msg = first_error.unwrap_or_else(|| "unknown error".into());
+        anyhow::bail!(
+            "sips failed to generate any previews.\nFirst error: {}\n\
+            If this is a permissions error, grant Terminal Full Disk Access in\n\
+            System Settings → Privacy & Security → Full Disk Access.",
+            msg
+        );
+    }
 
     // Upload previews to B2
     println!("Uploading previews to B2...");

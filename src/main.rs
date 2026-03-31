@@ -112,89 +112,92 @@ fn browse_menu(config: &Config) -> Result<()> {
 
 /// Returns updated metadata if it was edited, so the list can reflect the change immediately.
 fn shoot_menu(config: &Config, shoot: &b2::Shoot) -> Result<Option<b2::Metadata>> {
+    // Display shoot info and metadata
+    println!();
+    println!("  {}", shoot.name);
+    if let Some(m) = &shoot.metadata {
+        if !m.model.is_empty()    { println!("  Model:    {}", m.model); }
+        if !m.location.is_empty() { println!("  Location: {}", m.location); }
+        if !m.notes.is_empty()    { println!("  Notes:    {}", m.notes); }
+    }
+    println!();
+
+    loop {
+        let choice = Select::new(
+            "Options:",
+            vec![
+                "Download",
+                "View previews",
+                "Generate previews",
+                "Edit metadata",
+                "← Back",
+            ],
+        )
+        .prompt()?;
+
+        match choice {
+            "Download" => {
+                if let Err(e) = download_menu(config, shoot) {
+                    eprintln!("Error: {e}");
+                }
+            }
+            "View previews" => {
+                if let Err(e) = b2::browse_previews(shoot) {
+                    eprintln!("Error: {e}");
+                }
+            }
+            "Generate previews" => {
+                match b2::generate_and_upload_previews(shoot, config) {
+                    Ok(_) => println!("Previews uploaded."),
+                    Err(e) => eprintln!("Error: {e}"),
+                }
+            }
+            "Edit metadata" => {
+                if let Ok(meta) = edit_metadata(shoot) {
+                    return Ok(Some(meta));
+                }
+            }
+            _ => break,
+        }
+    }
+
+    Ok(None)
+}
+
+fn download_menu(config: &Config, shoot: &b2::Shoot) -> Result<()> {
     let status = b2::check_local_status(shoot, config);
     let status_str = match &status {
         b2::LocalStatus::NotDownloaded => "not downloaded",
-        b2::LocalStatus::Synced => "synced locally",
-        b2::LocalStatus::OutOfSync => "out of sync",
+        b2::LocalStatus::Synced        => "synced locally",
+        b2::LocalStatus::OutOfSync     => "out of sync",
     };
-
-    println!("\n{} — {}", shoot.name, status_str);
+    println!("  Local status: {}", status_str);
 
     if let b2::LocalStatus::Synced = status {
         let proceed = Confirm::new("Already synced. Download again anyway?")
             .with_default(false)
             .prompt()?;
-        if !proceed {
-            let choice = Select::new(
-                "Options:",
-                vec!["Generate & upload previews", "Browse previews", "Edit metadata", "← Back"],
-            )
-            .prompt()?;
-            match choice {
-                "Generate & upload previews" => {
-                    match b2::generate_and_upload_previews(shoot, config) {
-                        Ok(_) => println!("Previews uploaded."),
-                        Err(e) => eprintln!("Error: {e}"),
-                    }
-                }
-                "Browse previews" => {
-                    if let Err(e) = b2::browse_previews(shoot) {
-                        eprintln!("Error: {e}");
-                    }
-                }
-                "Edit metadata" => return edit_metadata(shoot).map(Some),
-                _ => {}
-            }
-            return Ok(None);
-        }
+        if !proceed { return Ok(()); }
     }
 
     let choice = Select::new(
-        "Options:",
-        vec![
-            "Download RAW only (.CR2)",
-            "Download JPEG only (.jpg)",
-            "Download both",
-            "Generate & upload previews",
-            "Browse previews",
-            "Edit metadata",
-            "← Back",
-        ],
+        "Download:",
+        vec!["RAW only (.CR2)", "JPEG only (.jpg)", "Both", "← Back"],
     )
     .prompt()?;
 
-    match choice {
-        "Generate & upload previews" => {
-            match b2::generate_and_upload_previews(shoot, config) {
-                Ok(_) => println!("Previews uploaded."),
-                Err(e) => eprintln!("Error: {e}"),
-            }
-            return Ok(None);
-        }
-        "Browse previews" => {
-            if let Err(e) = b2::browse_previews(shoot) {
-                eprintln!("Error: {e}");
-            }
-            return Ok(None);
-        }
-        "Edit metadata" => return edit_metadata(shoot).map(Some),
-        "← Back" => return Ok(None),
-        _ => {}
-    }
-
     let filter = match choice {
-        "Download RAW only (.CR2)" => b2::DownloadFilter::RawOnly,
-        "Download JPEG only (.jpg)" => b2::DownloadFilter::JpegOnly,
-        _ => b2::DownloadFilter::Both,
+        "RAW only (.CR2)"  => b2::DownloadFilter::RawOnly,
+        "JPEG only (.jpg)" => b2::DownloadFilter::JpegOnly,
+        "Both"             => b2::DownloadFilter::Both,
+        _                  => return Ok(()),
     };
 
     let local = shoot.local_path(config);
     println!("Downloading to: {}", local.display());
     b2::download_shoot(shoot, config, filter)?;
     println!("Download complete.");
-
-    Ok(None)
+    Ok(())
 }
 
 fn edit_metadata(shoot: &b2::Shoot) -> Result<b2::Metadata> {
