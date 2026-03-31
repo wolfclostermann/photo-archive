@@ -136,6 +136,7 @@ fn shoot_menu(config: &Config, shoot: &b2::Shoot) -> Result<Option<b2::Metadata>
                 "View previews",
                 "Generate previews",
                 "Purge local copy",
+                "Delete from B2",
                 "Edit metadata",
                 "← Back",
             ],
@@ -162,6 +163,30 @@ fn shoot_menu(config: &Config, shoot: &b2::Shoot) -> Result<Option<b2::Metadata>
             "Purge local copy" => {
                 if let Err(e) = purge_single(config, shoot) {
                     eprintln!("Error: {e}");
+                }
+            }
+            "Delete from B2" => {
+                println!("\n  WARNING: This permanently deletes {} from Backblaze B2.", shoot.name);
+                println!("  Local files are not affected.");
+                let first = Confirm::new("Are you sure you want to delete this from B2?")
+                    .with_default(false)
+                    .prompt()?;
+                if first {
+                    let second = Confirm::new(&format!(
+                        "Final confirmation — permanently delete {} from B2?",
+                        shoot.name
+                    ))
+                    .with_default(false)
+                    .prompt()?;
+                    if second {
+                        match b2::delete_from_b2(shoot) {
+                            Ok(_) => {
+                                println!("  {} deleted from B2.", shoot.name);
+                                break; // shoot no longer exists on B2, exit menu
+                            }
+                            Err(e) => eprintln!("Error: {e}"),
+                        }
+                    }
                 }
             }
             "Edit metadata" => {

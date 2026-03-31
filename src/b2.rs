@@ -360,6 +360,19 @@ pub fn verify_local_synced(shoot: &Shoot, config: &Config) -> Result<bool> {
     Ok(true)
 }
 
+/// Permanently deletes a shoot from B2. Local files are not touched.
+pub fn delete_from_b2(shoot: &Shoot) -> Result<()> {
+    let status = Command::new("rclone")
+        .args(["purge", &shoot.remote_path])
+        .status()
+        .context("failed to run rclone purge")?;
+
+    if !status.success() {
+        anyhow::bail!("rclone purge failed");
+    }
+    Ok(())
+}
+
 /// Deletes the local copy of a shoot using the filesystem only. No rclone involved.
 pub fn purge_local(shoot: &Shoot, config: &Config) -> Result<()> {
     let local = shoot.local_path(config);
