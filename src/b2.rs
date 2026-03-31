@@ -1,5 +1,5 @@
 use anyhow::{Context, Result};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::process::{Command, Stdio};
 
 use crate::config::Config;
@@ -17,19 +17,41 @@ struct RcloneSizeOutput {
     bytes: u64,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct Metadata {
+    #[serde(default)]
+    pub model: String,
+    #[serde(default)]
+    pub location: String,
+    #[serde(default)]
+    pub notes: String,
+}
+
 #[derive(Debug, Clone)]
 pub struct Shoot {
     pub name: String,
     pub year: String,
     pub remote_path: String,
     pub size_bytes: Option<u64>,
+    pub metadata: Option<Metadata>,
 }
 
 impl Shoot {
     pub fn display_name(&self) -> String {
-        match self.size_bytes {
-            Some(bytes) => format!("{}  ({})", self.name, format_bytes(bytes)),
-            None => self.name.clone(),
+        let meta = self.metadata.as_ref().map(|m| {
+            let parts: Vec<&str> = [m.model.as_str(), m.location.as_str()]
+                .iter()
+                .copied()
+                .filter(|s| !s.is_empty())
+                .collect();
+            parts.join(" · ")
+        });
+
+        match (meta.as_deref(), self.size_bytes) {
+            (Some(m), Some(b)) if !m.is_empty() => format!("{}  {}  ({})", self.name, m, format_bytes(b)),
+            (Some(m), None) if !m.is_empty()    => format!("{}  {}", self.name, m),
+            (_, Some(b))                         => format!("{}  ({})", self.name, format_bytes(b)),
+            _                                    => self.name.clone(),
         }
     }
 
@@ -85,6 +107,7 @@ pub fn list_shoots(config: &Config) -> Result<Vec<Shoot>> {
                 year: year.to_string(),
                 remote_path,
                 size_bytes: None,
+                metadata: None,
             }
         })
         .collect();
@@ -108,6 +131,38 @@ pub fn fetch_shoot_size(remote_path: &str) -> Result<u64> {
         serde_json::from_slice(&output.stdout).context("failed to parse rclone size output")?;
 
     Ok(size.bytes)
+}
+
+pub fn fetch_metadata(remote_path: &str) -> Option<Metadata> {
+    let json_path = format!("{}/shoot.json", remote_path);
+    let output = Command::new("rclone")
+        .args(["cat", &json_path])
+        .stderr(Stdio::null())
+        .output()
+        .ok()?;
+
+    if !output.status.success() || output.stdout.is_empty() {
+        return None;
+    }
+
+    serde_json::from_slice(&output.stdout).ok()
+}
+
+pub fn save_metadata(remote_path: &str, metadata: &Metadata) -> Result<()> {
+    let json = serde_json::to_string_pretty(metadata)?;
+    let tmp = std::env::temp_dir().join("photo-archive-shoot.json");
+    std::fs::write(&tmp, json)?;
+
+    let dest = format!("{}/shoot.json", remote_path);
+    let status = Command::new("rclone")
+        .args(["copyto", tmp.to_str().unwrap(), &dest])
+        .status()
+        .context("failed to run rclone copyto")?;
+
+    if !status.success() {
+        anyhow::bail!("failed to save metadata to B2");
+    }
+    Ok(())
 }
 
 pub enum LocalStatus {
@@ -159,6 +214,8 @@ pub fn download_shoot(shoot: &Shoot, config: &Config, filter: DownloadFilter) ->
         "4".to_string(),
         "--b2-chunk-size".to_string(),
         "96M".to_string(),
+        "--exclude".to_string(),
+        "shoot.json".to_string(),
     ];
 
     match filter {

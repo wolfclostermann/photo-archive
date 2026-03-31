@@ -3,7 +3,7 @@ mod config;
 
 use anyhow::Result;
 use config::Config;
-use inquire::{Confirm, Select};
+use inquire::{Confirm, Select, Text};
 use std::thread;
 
 fn main() -> Result<()> {
@@ -58,9 +58,9 @@ fn browse_menu(config: &Config) -> Result<()> {
         return Ok(());
     }
 
-    // Fetch all shoot sizes in parallel
-    println!("Fetching sizes...");
-    let handles: Vec<_> = shoots
+    // Fetch sizes and metadata in parallel
+    println!("Fetching sizes and metadata...");
+    let size_handles: Vec<_> = shoots
         .iter()
         .map(|s| {
             let path = s.remote_path.clone();
@@ -68,8 +68,19 @@ fn browse_menu(config: &Config) -> Result<()> {
         })
         .collect();
 
-    for (shoot, handle) in shoots.iter_mut().zip(handles) {
+    let meta_handles: Vec<_> = shoots
+        .iter()
+        .map(|s| {
+            let path = s.remote_path.clone();
+            thread::spawn(move || b2::fetch_metadata(&path))
+        })
+        .collect();
+
+    for (shoot, handle) in shoots.iter_mut().zip(size_handles) {
         shoot.size_bytes = handle.join().ok().and_then(|r| r.ok());
+    }
+    for (shoot, handle) in shoots.iter_mut().zip(meta_handles) {
+        shoot.metadata = handle.join().ok().flatten();
     }
 
     loop {
@@ -82,10 +93,10 @@ fn browse_menu(config: &Config) -> Result<()> {
             break;
         }
 
-        if let Some(shoot) = shoots.iter().find(|s| s.display_name() == choice) {
-            let shoot = shoot.clone();
-            if let Err(e) = shoot_menu(config, &shoot) {
-                eprintln!("Error: {e}");
+        if let Some(idx) = shoots.iter().position(|s| s.display_name() == choice) {
+            let updated = shoot_menu(config, &shoots[idx])?;
+            if let Some(meta) = updated {
+                shoots[idx].metadata = Some(meta);
             }
         }
     }
@@ -93,7 +104,8 @@ fn browse_menu(config: &Config) -> Result<()> {
     Ok(())
 }
 
-fn shoot_menu(config: &Config, shoot: &b2::Shoot) -> Result<()> {
+/// Returns updated metadata if it was edited, so the list can reflect the change immediately.
+fn shoot_menu(config: &Config, shoot: &b2::Shoot) -> Result<Option<b2::Metadata>> {
     let status = b2::check_local_status(shoot, config);
     let status_str = match &status {
         b2::LocalStatus::NotDownloaded => "not downloaded",
@@ -108,26 +120,40 @@ fn shoot_menu(config: &Config, shoot: &b2::Shoot) -> Result<()> {
             .with_default(false)
             .prompt()?;
         if !proceed {
-            return Ok(());
+            let choice = Select::new(
+                "Options:",
+                vec!["Edit metadata", "← Back"],
+            )
+            .prompt()?;
+            if choice == "Edit metadata" {
+                return edit_metadata(shoot).map(Some);
+            }
+            return Ok(None);
         }
     }
 
     let choice = Select::new(
-        "Download options:",
+        "Options:",
         vec![
             "Download RAW only (.CR2)",
             "Download JPEG only (.jpg)",
             "Download both",
+            "Edit metadata",
             "← Back",
         ],
     )
     .prompt()?;
 
+    match choice {
+        "Edit metadata" => return edit_metadata(shoot).map(Some),
+        "← Back" => return Ok(None),
+        _ => {}
+    }
+
     let filter = match choice {
         "Download RAW only (.CR2)" => b2::DownloadFilter::RawOnly,
         "Download JPEG only (.jpg)" => b2::DownloadFilter::JpegOnly,
-        "Download both" => b2::DownloadFilter::Both,
-        _ => return Ok(()),
+        _ => b2::DownloadFilter::Both,
     };
 
     let local = shoot.local_path(config);
@@ -135,7 +161,29 @@ fn shoot_menu(config: &Config, shoot: &b2::Shoot) -> Result<()> {
     b2::download_shoot(shoot, config, filter)?;
     println!("Download complete.");
 
-    Ok(())
+    Ok(None)
+}
+
+fn edit_metadata(shoot: &b2::Shoot) -> Result<b2::Metadata> {
+    let existing = shoot.metadata.clone().unwrap_or_default();
+
+    let model = Text::new("Model:")
+        .with_initial_value(&existing.model)
+        .prompt()?;
+
+    let location = Text::new("Location:")
+        .with_initial_value(&existing.location)
+        .prompt()?;
+
+    let notes = Text::new("Notes:")
+        .with_initial_value(&existing.notes)
+        .prompt()?;
+
+    let metadata = b2::Metadata { model, location, notes };
+    b2::save_metadata(&shoot.remote_path, &metadata)?;
+    println!("Metadata saved.");
+
+    Ok(metadata)
 }
 
 fn lightroom_menu(config: &Config) -> Result<()> {
