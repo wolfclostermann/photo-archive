@@ -223,7 +223,7 @@ pub fn generate_and_upload_previews(shoot: &Shoot, config: &Config) -> Result<()
         let result = Command::new("/usr/bin/sips")
             .args([
                 "-s", "format", "jpeg",
-                "--resampleLongEdge", "1024",
+                "--resampleHeightWidthMax", "1024",
                 src.to_str().unwrap(),
                 "--out", out.to_str().unwrap(),
             ])
