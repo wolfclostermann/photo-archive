@@ -64,10 +64,19 @@ pub fn list_shoots(config: &Config) -> Result<Vec<Shoot>> {
     let entries: Vec<RcloneLsEntry> = serde_json::from_slice(&output.stdout)
         .context("failed to parse rclone lsjson output")?;
 
-    // Keep only depth-2 paths: "2025/2025-08-20"
+    // Keep only depth-2 paths matching "YYYY/YYYY-MM-DD"
     let mut shoots: Vec<Shoot> = entries
         .into_iter()
-        .filter(|e| e.is_dir && e.path.chars().filter(|&c| c == '/').count() == 1)
+        .filter(|e| {
+            if !e.is_dir { return false; }
+            let mut parts = e.path.splitn(2, '/');
+            let year = parts.next().unwrap_or("");
+            let name = parts.next().unwrap_or("");
+            year.len() == 4 && year.chars().all(|c| c.is_ascii_digit())
+                && name.len() == 10 && name.chars().enumerate().all(|(i, c)| {
+                    if i == 4 || i == 7 { c == '-' } else { c.is_ascii_digit() }
+                })
+        })
         .map(|e| {
             let (year, name) = e.path.split_once('/').unwrap();
             let remote_path = format!("{}/{}", config.pictures_remote, e.path);
