@@ -14,9 +14,9 @@ impl Default for Config {
         let home = dirs::home_dir().expect("cannot find home directory");
         Self {
             photosets_remote: env::var("B2_PHOTOSETS_REMOTE")
-                .unwrap_or_else(|_| "b2:wlta-photography/Photosets".into()),
+                .expect("B2_PHOTOSETS_REMOTE must be set in .env or environment"),
             lightroom_remote: env::var("B2_LIGHTROOM_REMOTE")
-                .unwrap_or_else(|_| "b2:wlta-photography/Lightroom".into()),
+                .expect("B2_LIGHTROOM_REMOTE must be set in .env or environment"),
             local_photosets: env::var("LOCAL_PHOTOSETS")
                 .map(PathBuf::from)
                 .unwrap_or_else(|_| home.join("Pictures/Photosets")),
