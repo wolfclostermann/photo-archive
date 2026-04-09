@@ -57,7 +57,7 @@ impl Shoot {
     }
 
     pub fn local_path(&self, config: &Config) -> std::path::PathBuf {
-        config.local_pictures.join(&self.year).join(&self.name)
+        config.local_photosets.join(&self.year).join(&self.name)
     }
 
     pub fn previews_remote(&self) -> String {
@@ -79,7 +79,7 @@ pub fn format_bytes(bytes: u64) -> String {
 
 pub fn list_shoots(config: &Config) -> Result<Vec<Shoot>> {
     let output = Command::new("rclone")
-        .args(["lsjson", "--dirs-only", "--recursive", &config.pictures_remote])
+        .args(["lsjson", "--dirs-only", "--recursive", &config.photosets_remote])
         .output()
         .context("failed to run rclone lsjson")?;
 
@@ -106,7 +106,7 @@ pub fn list_shoots(config: &Config) -> Result<Vec<Shoot>> {
         })
         .map(|e| {
             let (year, name) = e.path.split_once('/').unwrap();
-            let remote_path = format!("{}/{}", config.pictures_remote, e.path);
+            let remote_path = format!("{}/{}", config.photosets_remote, e.path);
             Shoot {
                 name: name.to_string(),
                 year: year.to_string(),
@@ -461,8 +461,8 @@ pub fn sync_photos_up(config: &Config) -> Result<()> {
     let status = Command::new("rclone")
         .args([
             "copy",
-            config.local_pictures.to_str().unwrap(),
-            &config.pictures_remote,
+            config.local_photosets.to_str().unwrap(),
+            &config.photosets_remote,
             "--progress",
             "--transfers", "4",
             "--b2-chunk-size", "96M",
