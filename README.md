@@ -55,7 +55,7 @@ cargo build --release
 ## B2 structure
 
 ```
-b2:wlta-photography/
+b2:your-bucket/
   Pictures/
     2025/
       2025-08-20/
@@ -72,4 +72,4 @@ Local mirror lives at `~/Pictures/`, maintaining the same folder structure. Prev
 
 ## Configuration
 
-Paths and bucket name are in `src/config.rs`. Edit and rebuild if anything changes.
+Copy `.env.example` to `.env` and set your bucket name and local paths. Values are read at startup; no rebuild needed.
