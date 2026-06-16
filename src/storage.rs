@@ -632,9 +632,12 @@ pub fn migrate_shoot_to_split(
         // Use per-file moveto so source and destination never overlap (rclone move
         // refuses when dst is a subdirectory of src). moveto is a server-side rename
         // on both OneDrive and B2, so no bytes are transferred.
-        println!("  Moving {} files...", to_move.len());
+        let total = to_move.len();
         for (i, (filename, subdir)) in to_move.iter().enumerate() {
-            print!("\r  {}/{}", i + 1, to_move.len());
+            let pct    = (i + 1) * 100 / total;
+            let filled = (i + 1) * 20  / total;
+            let bar    = format!("[{}{}]", "=".repeat(filled), " ".repeat(20 - filled));
+            print!("\r  {} {:>3}%  {}", bar, pct, filename);
             let _ = std::io::Write::flush(&mut std::io::stdout());
 
             let src = format!("{}/{}", remote, filename);
@@ -655,7 +658,7 @@ pub fn migrate_shoot_to_split(
                 anyhow::bail!("failed to move {}: {}", filename, stderr.trim());
             }
         }
-        println!("\r  {} files moved.        ", to_move.len());
+        println!("\r{:<60}", format!("  {} files moved.", total));
         any_work = true;
     }
 
