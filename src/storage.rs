@@ -540,26 +540,6 @@ pub fn detect_local_layout(local: &Path) -> ShootLayout {
     }
 }
 
-/// Returns Split if the remote shoot directory has raw/ or jpeg/ as top-level subdirectories.
-pub fn detect_remote_layout(remote: &str) -> ShootLayout {
-    let output = Command::new("rclone")
-        .args(["lsjson", "--dirs-only", remote])
-        .stderr(Stdio::null())
-        .output();
-
-    match output {
-        Ok(o) if o.status.success() => {
-            let entries: Vec<RcloneLsEntry> =
-                serde_json::from_slice(&o.stdout).unwrap_or_default();
-            if entries.iter().any(|e| e.is_dir && (e.path == "raw" || e.path == "jpeg")) {
-                ShootLayout::Split
-            } else {
-                ShootLayout::Flat
-            }
-        }
-        _ => ShootLayout::Flat,
-    }
-}
 
 /// Reorganises a shoot from a flat layout into raw/ and jpeg/ subdirectories.
 /// Migrates the local copy first (if present), then each remote tier.
@@ -614,63 +594,69 @@ pub fn migrate_shoot_to_split(
     }
 
     for (remote, backend) in remotes {
-        if detect_remote_layout(remote) == ShootLayout::Flat {
-            println!("  Migrating remote: {}", remote);
-
-            // Move CR2 files into raw/. Excludes are listed before includes so already-moved
-            // files in raw/ are skipped on a re-run (filters are evaluated first-match-wins).
-            let raw_remote  = format!("{}/raw",  remote);
-            let jpeg_remote = format!("{}/jpeg", remote);
-
-            let mut raw_args = vec![
-                "move".to_string(), remote.to_string(), raw_remote,
-                "--exclude".to_string(), "raw/**".to_string(),
-                "--exclude".to_string(), "jpeg/**".to_string(),
-                "--exclude".to_string(), "previews/**".to_string(),
-                "--exclude".to_string(), "shoot.json".to_string(),
-                "--include".to_string(), "*.CR2".to_string(),
-                "--include".to_string(), "*.cr2".to_string(),
-                "--progress".to_string(),
-            ];
-            if backend.needs_b2_chunk_flag() {
-                raw_args.extend(["--b2-chunk-size".into(), "96M".into()]);
-            }
-            let status = Command::new("rclone")
-                .args(&raw_args)
-                .status()
-                .context("failed to run rclone move (RAW)")?;
-            if !status.success() {
-                anyhow::bail!("failed to move RAW files on {}", remote);
-            }
-
-            let mut jpeg_args = vec![
-                "move".to_string(), remote.to_string(), jpeg_remote,
-                "--exclude".to_string(), "raw/**".to_string(),
-                "--exclude".to_string(), "jpeg/**".to_string(),
-                "--exclude".to_string(), "previews/**".to_string(),
-                "--exclude".to_string(), "shoot.json".to_string(),
-                "--include".to_string(), "*.jpg".to_string(),
-                "--include".to_string(), "*.JPG".to_string(),
-                "--include".to_string(), "*.jpeg".to_string(),
-                "--include".to_string(), "*.JPEG".to_string(),
-                "--progress".to_string(),
-            ];
-            if backend.needs_b2_chunk_flag() {
-                jpeg_args.extend(["--b2-chunk-size".into(), "96M".into()]);
-            }
-            let status = Command::new("rclone")
-                .args(&jpeg_args)
-                .status()
-                .context("failed to run rclone move (JPEG)")?;
-            if !status.success() {
-                anyhow::bail!("failed to move JPEG files on {}", remote);
-            }
-
-            println!("  Remote migrated.");
-            any_work = true;
-        } else {
-            println!("  Remote already uses split layout, skipping.");
+        // List direct children of the shoot directory (non-recursive, files and dirs).
+        let output = Command::new("rclone")
+            .args(["lsjson", remote])
+            .stderr(Stdio::null())
+            .output()
+            .context("failed to list remote files")?;
+        if !output.status.success() {
+            anyhow::bail!("failed to list files on {}", remote);
         }
+        let entries: Vec<RcloneLsEntry> = serde_json::from_slice(&output.stdout)
+            .context("failed to parse rclone lsjson")?;
+
+        // Collect root-level photo files and where they should go.
+        // Dirs (raw/, jpeg/, previews/) are is_dir=true and filtered out.
+        let to_move: Vec<(String, &'static str)> = entries.iter()
+            .filter(|e| !e.is_dir)
+            .filter_map(|e| {
+                let ext = std::path::Path::new(&e.path)
+                    .extension()?
+                    .to_str()?
+                    .to_ascii_lowercase();
+                let subdir = match ext.as_str() {
+                    "cr2"          => "raw",
+                    "jpg" | "jpeg" => "jpeg",
+                    _ => return None,
+                };
+                Some((e.path.clone(), subdir))
+            })
+            .collect();
+
+        if to_move.is_empty() {
+            println!("  Remote already uses split layout, skipping.");
+            continue;
+        }
+
+        // Use per-file moveto so source and destination never overlap (rclone move
+        // refuses when dst is a subdirectory of src). moveto is a server-side rename
+        // on both OneDrive and B2, so no bytes are transferred.
+        println!("  Moving {} files...", to_move.len());
+        for (i, (filename, subdir)) in to_move.iter().enumerate() {
+            print!("\r  {}/{}", i + 1, to_move.len());
+            let _ = std::io::Write::flush(&mut std::io::stdout());
+
+            let src = format!("{}/{}", remote, filename);
+            let dst = format!("{}/{}/{}", remote, subdir, filename);
+            let mut args = vec!["moveto".to_string(), src, dst];
+            if backend.needs_b2_chunk_flag() {
+                args.extend(["--b2-chunk-size".into(), "96M".into()]);
+            }
+            let output = Command::new("rclone")
+                .args(&args)
+                .stdout(Stdio::null())
+                .stderr(Stdio::piped())
+                .output()
+                .context("failed to run rclone moveto")?;
+            if !output.status.success() {
+                println!();
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                anyhow::bail!("failed to move {}: {}", filename, stderr.trim());
+            }
+        }
+        println!("\r  {} files moved.        ", to_move.len());
+        any_work = true;
     }
 
     if !any_work {
