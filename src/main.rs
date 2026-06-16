@@ -242,8 +242,9 @@ fn shoot_menu(config: &Config, shoot: &storage::Shoot) -> Result<Option<storage:
                 }
             }
             "Edit metadata" => {
-                if let Ok(meta) = edit_metadata(shoot) {
-                    return Ok(Some(meta));
+                match edit_metadata(shoot) {
+                    Ok(meta) => return Ok(Some(meta)),
+                    Err(e) => eprintln!("Error saving metadata: {e}"),
                 }
             }
             "Delete" => {
