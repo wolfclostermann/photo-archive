@@ -3,6 +3,10 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::Path;
 use std::process::{Command, Stdio};
+use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::thread;
+use std::time::Duration;
 
 use crate::config::{Backend, Config, Tier};
 
@@ -632,31 +636,67 @@ pub fn migrate_shoot_to_split(
         // Use per-file moveto so source and destination never overlap (rclone move
         // refuses when dst is a subdirectory of src). moveto is a server-side rename
         // on both OneDrive and B2, so no bytes are transferred.
-        let total = to_move.len();
-        for (i, (filename, subdir)) in to_move.iter().enumerate() {
-            let pct    = (i + 1) * 100 / total;
-            let filled = (i + 1) * 20  / total;
-            let bar    = format!("[{}{}]", "=".repeat(filled), " ".repeat(20 - filled));
-            print!("\r  {} {:>3}%  {}", bar, pct, filename);
-            let _ = std::io::Write::flush(&mut std::io::stdout());
+        let total      = to_move.len();
+        let to_move    = Arc::new(to_move);
+        let next_idx   = Arc::new(AtomicUsize::new(0));
+        let completed  = Arc::new(AtomicUsize::new(0));
+        let first_err: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
 
-            let src = format!("{}/{}", remote, filename);
-            let dst = format!("{}/{}/{}", remote, subdir, filename);
-            let mut args = vec!["moveto".to_string(), src, dst];
-            if backend.needs_b2_chunk_flag() {
-                args.extend(["--b2-chunk-size".into(), "96M".into()]);
-            }
-            let output = Command::new("rclone")
-                .args(&args)
-                .stdout(Stdio::null())
-                .stderr(Stdio::piped())
-                .output()
-                .context("failed to run rclone moveto")?;
-            if !output.status.success() {
-                println!();
-                let stderr = String::from_utf8_lossy(&output.stderr);
-                anyhow::bail!("failed to move {}: {}", filename, stderr.trim());
-            }
+        let handles: Vec<_> = (0..8usize.min(total)).map(|_| {
+            let to_move   = Arc::clone(&to_move);
+            let next_idx  = Arc::clone(&next_idx);
+            let completed = Arc::clone(&completed);
+            let first_err = Arc::clone(&first_err);
+            let remote    = remote.to_string();
+            let needs_b2  = backend.needs_b2_chunk_flag();
+            thread::spawn(move || {
+                loop {
+                    if first_err.lock().unwrap().is_some() { break; }
+                    let idx = next_idx.fetch_add(1, Ordering::Relaxed);
+                    if idx >= to_move.len() { break; }
+                    let (filename, subdir) = &to_move[idx];
+                    let src = format!("{}/{}", remote, filename);
+                    let dst = format!("{}/{}/{}", remote, subdir, filename);
+                    let mut args = vec!["moveto".to_string(), src, dst];
+                    if needs_b2 { args.extend(["--b2-chunk-size".into(), "96M".into()]); }
+                    match Command::new("rclone").args(&args)
+                        .stdout(Stdio::null()).stderr(Stdio::piped()).output()
+                    {
+                        Ok(o) if o.status.success() => {
+                            completed.fetch_add(1, Ordering::Relaxed);
+                        }
+                        Ok(o) => {
+                            let mut err = first_err.lock().unwrap();
+                            if err.is_none() {
+                                *err = Some(format!("failed to move {}: {}",
+                                    filename, String::from_utf8_lossy(&o.stderr).trim()));
+                            }
+                            break;
+                        }
+                        Err(e) => {
+                            let mut err = first_err.lock().unwrap();
+                            if err.is_none() { *err = Some(format!("failed to spawn rclone: {e}")); }
+                            break;
+                        }
+                    }
+                }
+            })
+        }).collect();
+
+        loop {
+            let done   = completed.load(Ordering::Relaxed);
+            let pct    = done * 100 / total;
+            let filled = done * 20  / total;
+            let bar    = format!("[{}{}]", "=".repeat(filled), " ".repeat(20 - filled));
+            print!("\r  {} {:>3}%  ({}/{})", bar, pct, done, total);
+            let _ = std::io::Write::flush(&mut std::io::stdout());
+            if done >= total || first_err.lock().unwrap().is_some() { break; }
+            thread::sleep(Duration::from_millis(100));
+        }
+        for handle in handles { handle.join().ok(); }
+        if let Some(err) = first_err.lock().unwrap().take() {
+            println!();
+            anyhow::bail!("{}", err);
         }
         println!("\r{:<60}", format!("  {} files moved.", total));
         any_work = true;
