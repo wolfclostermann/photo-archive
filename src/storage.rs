@@ -1,9 +1,10 @@
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::path::Path;
 use std::process::{Command, Stdio};
 
-use crate::config::Config;
+use crate::config::{Backend, Config, Tier};
 
 #[derive(Debug, Deserialize)]
 struct RcloneLsEntry {
@@ -32,13 +33,43 @@ pub struct Metadata {
 pub struct Shoot {
     pub name: String,
     pub year: String,
-    pub remote_path: String,
+    pub hot_path: Option<String>,
+    pub cold_path: Option<String>,
     pub size_bytes: Option<u64>,
     pub metadata: Option<Metadata>,
 }
 
 impl Shoot {
+    /// Preferred remote for read operations: hot if available, else cold.
+    pub fn active_remote(&self) -> Option<&str> {
+        self.hot_path.as_deref().or(self.cold_path.as_deref())
+    }
+
+    /// Backend associated with active_remote.
+    pub fn active_backend<'a>(&self, config: &'a Config) -> Option<&'a Backend> {
+        if self.hot_path.is_some() {
+            config.hot.as_ref().map(|bc| &bc.backend)
+        } else {
+            config.cold.as_ref().map(|bc| &bc.backend)
+        }
+    }
+
+    pub fn previews_remote(&self) -> Option<String> {
+        self.active_remote().map(|r| format!("{}/previews", r))
+    }
+
+    pub fn local_path(&self, local_photosets: &Path) -> std::path::PathBuf {
+        local_photosets.join(&self.year).join(&self.name)
+    }
+
     pub fn display_name(&self) -> String {
+        let badge = match (&self.hot_path, &self.cold_path) {
+            (Some(_), Some(_)) => "[H+C]",
+            (Some(_), None)    => "[H]  ",
+            (None, Some(_))    => "[C]  ",
+            (None, None)       => "     ",
+        };
+
         let meta = self.metadata.as_ref().map(|m| {
             let parts: Vec<&str> = [m.model.as_str(), m.location.as_str()]
                 .iter()
@@ -48,20 +79,15 @@ impl Shoot {
             parts.join(" · ")
         });
 
-        match (meta.as_deref(), self.size_bytes) {
-            (Some(m), Some(b)) if !m.is_empty() => format!("{}  {}  ({})", self.name, m, format_bytes(b)),
-            (Some(m), None) if !m.is_empty()    => format!("{}  {}", self.name, m),
-            (_, Some(b))                         => format!("{}  ({})", self.name, format_bytes(b)),
-            _                                    => self.name.clone(),
+        let name_and_meta = match meta.as_deref() {
+            Some(m) if !m.is_empty() => format!("{}  {}", self.name, m),
+            _ => self.name.clone(),
+        };
+
+        match self.size_bytes {
+            Some(b) => format!("{}  {}  ({})", badge, name_and_meta, format_bytes(b)),
+            None    => format!("{}  {}", badge, name_and_meta),
         }
-    }
-
-    pub fn local_path(&self, config: &Config) -> std::path::PathBuf {
-        config.local_photosets.join(&self.year).join(&self.name)
-    }
-
-    pub fn previews_remote(&self) -> String {
-        format!("{}/previews", self.remote_path)
     }
 }
 
@@ -77,9 +103,31 @@ pub fn format_bytes(bytes: u64) -> String {
     }
 }
 
-pub fn list_shoots(config: &Config) -> Result<Vec<Shoot>> {
+pub fn remote_exists(remote: &str) -> bool {
+    Command::new("rclone")
+        .args(["lsd", remote, "--max-depth", "0"])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
+pub fn create_remote_dir(remote: &str) -> Result<()> {
+    let status = Command::new("rclone")
+        .args(["mkdir", remote])
+        .status()
+        .context("failed to run rclone mkdir")?;
+    if !status.success() {
+        anyhow::bail!("failed to create remote directory");
+    }
+    Ok(())
+}
+
+/// Lists shoots from a single remote, tagging each entry with the given tier path field.
+pub fn list_shoots_from(remote: &str, tier: &Tier) -> Result<Vec<Shoot>> {
     let output = Command::new("rclone")
-        .args(["lsjson", "--dirs-only", "--recursive", &config.photosets_remote])
+        .args(["lsjson", "--dirs-only", "--recursive", remote])
         .output()
         .context("failed to run rclone lsjson")?;
 
@@ -91,8 +139,7 @@ pub fn list_shoots(config: &Config) -> Result<Vec<Shoot>> {
     let entries: Vec<RcloneLsEntry> = serde_json::from_slice(&output.stdout)
         .context("failed to parse rclone lsjson output")?;
 
-    // Keep only depth-2 paths matching "YYYY/YYYY-MM-DD"
-    let mut shoots: Vec<Shoot> = entries
+    let shoots = entries
         .into_iter()
         .filter(|e| {
             if !e.is_dir { return false; }
@@ -106,19 +153,41 @@ pub fn list_shoots(config: &Config) -> Result<Vec<Shoot>> {
         })
         .map(|e| {
             let (year, name) = e.path.split_once('/').unwrap();
-            let remote_path = format!("{}/{}", config.photosets_remote, e.path);
+            let remote_path = format!("{}/{}", remote, e.path);
+            let (hot_path, cold_path) = match tier {
+                Tier::Hot  => (Some(remote_path), None),
+                Tier::Cold => (None, Some(remote_path)),
+            };
             Shoot {
                 name: name.to_string(),
                 year: year.to_string(),
-                remote_path,
+                hot_path,
+                cold_path,
                 size_bytes: None,
                 metadata: None,
             }
         })
         .collect();
 
-    shoots.sort_by(|a, b| b.name.cmp(&a.name));
     Ok(shoots)
+}
+
+/// Merges shoot lists from hot and cold backends into a single deduplicated list.
+pub fn merge_shoot_lists(hot: Vec<Shoot>, cold: Vec<Shoot>) -> Vec<Shoot> {
+    let mut map: HashMap<String, Shoot> = HashMap::new();
+    for shoot in hot {
+        map.insert(shoot.name.clone(), shoot);
+    }
+    for cold_shoot in cold {
+        map.entry(cold_shoot.name.clone())
+            .and_modify(|existing| {
+                existing.cold_path = cold_shoot.cold_path.clone();
+            })
+            .or_insert(cold_shoot);
+    }
+    let mut shoots: Vec<Shoot> = map.into_values().collect();
+    shoots.sort_by(|a, b| b.name.cmp(&a.name));
+    shoots
 }
 
 pub fn fetch_shoot_size(remote_path: &str) -> Result<u64> {
@@ -165,15 +234,19 @@ pub fn save_metadata(remote_path: &str, metadata: &Metadata) -> Result<()> {
         .context("failed to run rclone copyto")?;
 
     if !status.success() {
-        anyhow::bail!("failed to save metadata to B2");
+        anyhow::bail!("failed to save metadata");
     }
     Ok(())
 }
 
-/// Generates JPEG previews from local shoot files and uploads them to B2.
+/// Generates JPEG previews from local shoot files and uploads them to the given remote.
 /// Prefers JPEG source over CR2 for the same filename stem to avoid RAW decode overhead.
-pub fn generate_and_upload_previews(shoot: &Shoot, config: &Config) -> Result<()> {
-    let local = shoot.local_path(config);
+pub fn generate_and_upload_previews(
+    shoot: &Shoot,
+    local: &Path,
+    upload_remote: &str,
+    backend: &Backend,
+) -> Result<()> {
     if !local.exists() {
         anyhow::bail!("shoot is not downloaded locally — download it first");
     }
@@ -183,9 +256,8 @@ pub fn generate_and_upload_previews(shoot: &Shoot, config: &Config) -> Result<()
         .join(&shoot.name);
     std::fs::create_dir_all(&preview_dir)?;
 
-    // Collect source files, preferring JPEG over CR2 per stem
     let mut sources: HashMap<String, std::path::PathBuf> = HashMap::new();
-    for entry in std::fs::read_dir(&local)? {
+    for entry in std::fs::read_dir(local)? {
         let entry = entry?;
         let path = entry.path();
         if !path.is_file() { continue; }
@@ -199,7 +271,6 @@ pub fn generate_and_upload_previews(shoot: &Shoot, config: &Config) -> Result<()
             .unwrap_or("")
             .to_string();
         let is_jpeg = matches!(ext.as_str(), "jpg" | "jpeg");
-        // Insert if not present, or upgrade CR2 entry to JPEG
         if is_jpeg || !sources.contains_key(&stem) {
             sources.insert(stem, path);
         }
@@ -250,16 +321,19 @@ pub fn generate_and_upload_previews(shoot: &Shoot, config: &Config) -> Result<()
         );
     }
 
-    // Upload previews to B2
-    println!("Uploading previews to B2...");
+    println!("Uploading previews...");
+    let mut args = vec![
+        "copy".to_string(),
+        preview_dir.to_str().unwrap().to_string(),
+        upload_remote.to_string(),
+        "--progress".to_string(),
+        "--transfers".to_string(), "4".to_string(),
+    ];
+    if backend.needs_b2_chunk_flag() {
+        args.extend(["--b2-chunk-size".into(), "96M".into()]);
+    }
     let status = Command::new("rclone")
-        .args([
-            "copy",
-            preview_dir.to_str().unwrap(),
-            &shoot.previews_remote(),
-            "--progress",
-            "--transfers", "4",
-        ])
+        .args(&args)
         .status()
         .context("failed to run rclone")?;
 
@@ -270,9 +344,9 @@ pub fn generate_and_upload_previews(shoot: &Shoot, config: &Config) -> Result<()
     Ok(())
 }
 
-pub fn previews_exist(shoot: &Shoot) -> bool {
+pub fn previews_exist(previews_remote: &str) -> bool {
     Command::new("rclone")
-        .args(["ls", &shoot.previews_remote()])
+        .args(["ls", previews_remote])
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .output()
@@ -280,11 +354,10 @@ pub fn previews_exist(shoot: &Shoot) -> bool {
         .unwrap_or(false)
 }
 
-/// Downloads previews from B2 to a local temp directory and opens it in Finder.
-pub fn browse_previews(shoot: &Shoot) -> Result<()> {
-    // Check previews exist on B2
+/// Downloads previews to a temp directory and opens it in Finder.
+pub fn browse_previews(shoot_name: &str, previews_remote: &str) -> Result<()> {
     let check = Command::new("rclone")
-        .args(["ls", &shoot.previews_remote()])
+        .args(["ls", previews_remote])
         .stderr(Stdio::null())
         .output()
         .context("failed to run rclone ls")?;
@@ -295,14 +368,14 @@ pub fn browse_previews(shoot: &Shoot) -> Result<()> {
 
     let preview_dir = std::env::temp_dir()
         .join("photo-archive-previews")
-        .join(&shoot.name);
+        .join(shoot_name);
     std::fs::create_dir_all(&preview_dir)?;
 
     println!("Downloading previews...");
     let status = Command::new("rclone")
         .args([
             "copy",
-            &shoot.previews_remote(),
+            previews_remote,
             preview_dir.to_str().unwrap(),
             "--progress",
             "--transfers", "4",
@@ -322,10 +395,8 @@ pub fn browse_previews(shoot: &Shoot) -> Result<()> {
     Ok(())
 }
 
-/// Verifies that every local file in the shoot exists on B2 with a matching checksum.
-/// Uses --one-way so we check local→B2 only. B2 is never written to or deleted from here.
-pub fn verify_local_synced(shoot: &Shoot, config: &Config) -> Result<bool> {
-    let local = shoot.local_path(config);
+/// Verifies every local file exists on the remote with a matching checksum (one-way: local→remote).
+pub fn verify_local_synced(local: &Path, remote: &str) -> Result<bool> {
     if !local.exists() {
         return Ok(false);
     }
@@ -334,7 +405,7 @@ pub fn verify_local_synced(shoot: &Shoot, config: &Config) -> Result<bool> {
         .args([
             "check",
             local.to_str().unwrap(),
-            &shoot.remote_path,
+            remote,
             "--one-way",
             "--exclude", "shoot.json",
             "--exclude", "previews/**",
@@ -346,7 +417,6 @@ pub fn verify_local_synced(shoot: &Shoot, config: &Config) -> Result<bool> {
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
-        // Surface any meaningful error lines (rclone prints differences to stderr)
         let errors: Vec<&str> = stderr
             .lines()
             .filter(|l| l.contains("ERROR") || l.contains("not found"))
@@ -360,10 +430,40 @@ pub fn verify_local_synced(shoot: &Shoot, config: &Config) -> Result<bool> {
     Ok(true)
 }
 
-/// Permanently deletes a shoot from B2. Local files are not touched.
-pub fn delete_from_b2(shoot: &Shoot) -> Result<()> {
+/// Verifies every file in src exists in dst with a matching checksum (one-way: src→dst).
+pub fn verify_remote_synced(src: &str, dst: &str) -> Result<bool> {
+    let output = Command::new("rclone")
+        .args([
+            "check",
+            src,
+            dst,
+            "--one-way",
+            "--exclude", "previews/**",
+        ])
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .output()
+        .context("failed to run rclone check")?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let errors: Vec<&str> = stderr
+            .lines()
+            .filter(|l| l.contains("ERROR") || l.contains("not found"))
+            .collect();
+        if !errors.is_empty() {
+            anyhow::bail!("{}", errors.join("\n"));
+        }
+        return Ok(false);
+    }
+
+    Ok(true)
+}
+
+/// Permanently deletes a remote path. Local files are not touched.
+pub fn delete_remote(remote_path: &str) -> Result<()> {
     let status = Command::new("rclone")
-        .args(["purge", &shoot.remote_path])
+        .args(["purge", remote_path])
         .status()
         .context("failed to run rclone purge")?;
 
@@ -373,10 +473,9 @@ pub fn delete_from_b2(shoot: &Shoot) -> Result<()> {
     Ok(())
 }
 
-/// Deletes the local copy of a shoot using the filesystem only. No rclone involved.
-pub fn purge_local(shoot: &Shoot, config: &Config) -> Result<()> {
-    let local = shoot.local_path(config);
-    std::fs::remove_dir_all(&local)
+/// Deletes a local directory using the filesystem only. No rclone involved.
+pub fn purge_local(local: &Path) -> Result<()> {
+    std::fs::remove_dir_all(local)
         .with_context(|| format!("failed to delete {}", local.display()))
 }
 
@@ -386,8 +485,7 @@ pub enum LocalStatus {
     OutOfSync,
 }
 
-pub fn check_local_status(shoot: &Shoot, config: &Config) -> LocalStatus {
-    let local = shoot.local_path(config);
+pub fn check_local_status(local: &Path, remote: &str) -> LocalStatus {
     if !local.exists() {
         return LocalStatus::NotDownloaded;
     }
@@ -397,7 +495,7 @@ pub fn check_local_status(shoot: &Shoot, config: &Config) -> LocalStatus {
             "check",
             "--one-way",
             "--quiet",
-            &shoot.remote_path,
+            remote,
             local.to_str().unwrap(),
         ])
         .stdout(Stdio::null())
@@ -416,20 +514,27 @@ pub enum DownloadFilter {
     Both,
 }
 
-pub fn download_shoot(shoot: &Shoot, config: &Config, filter: DownloadFilter) -> Result<()> {
-    let local = shoot.local_path(config);
+pub fn download_shoot(
+    remote_path: &str,
+    local: &Path,
+    filter: DownloadFilter,
+    backend: &Backend,
+) -> Result<()> {
     let local_str = local.to_str().unwrap().to_string();
 
     let mut args = vec![
         "copy".to_string(),
-        shoot.remote_path.clone(),
+        remote_path.to_string(),
         local_str,
         "--progress".to_string(),
         "--transfers".to_string(), "4".to_string(),
-        "--b2-chunk-size".to_string(), "96M".to_string(),
         "--exclude".to_string(), "shoot.json".to_string(),
         "--exclude".to_string(), "previews/**".to_string(),
     ];
+
+    if backend.needs_b2_chunk_flag() {
+        args.extend(["--b2-chunk-size".into(), "96M".into()]);
+    }
 
     match filter {
         DownloadFilter::RawOnly => {
@@ -457,16 +562,52 @@ pub fn download_shoot(shoot: &Shoot, config: &Config, filter: DownloadFilter) ->
     Ok(())
 }
 
-pub fn sync_photos_up(config: &Config) -> Result<()> {
+/// Copies all files from one remote path to another. Use dst_backend for upload flags.
+/// Pass exclude_previews=true when archiving to cold storage (previews aren't useful there).
+pub fn copy_remote_to_remote(
+    src: &str,
+    dst: &str,
+    dst_backend: &Backend,
+    exclude_previews: bool,
+) -> Result<()> {
+    let mut args = vec![
+        "copy".to_string(),
+        src.to_string(),
+        dst.to_string(),
+        "--progress".to_string(),
+        "--transfers".to_string(), "4".to_string(),
+    ];
+    if dst_backend.needs_b2_chunk_flag() {
+        args.extend(["--b2-chunk-size".into(), "96M".into()]);
+    }
+    if exclude_previews {
+        args.extend(["--exclude".into(), "previews/**".into()]);
+    }
     let status = Command::new("rclone")
-        .args([
-            "copy",
-            config.local_photosets.to_str().unwrap(),
-            &config.photosets_remote,
-            "--progress",
-            "--transfers", "4",
-            "--b2-chunk-size", "96M",
-        ])
+        .args(&args)
+        .status()
+        .context("failed to run rclone copy")?;
+
+    if !status.success() {
+        anyhow::bail!("rclone copy failed");
+    }
+    Ok(())
+}
+
+/// Syncs local photosets directory up to a remote.
+pub fn sync_up(local: &Path, remote: &str, backend: &Backend) -> Result<()> {
+    let mut args = vec![
+        "copy".to_string(),
+        local.to_str().unwrap().to_string(),
+        remote.to_string(),
+        "--progress".to_string(),
+        "--transfers".to_string(), "4".to_string(),
+    ];
+    if backend.needs_b2_chunk_flag() {
+        args.extend(["--b2-chunk-size".into(), "96M".into()]);
+    }
+    let status = Command::new("rclone")
+        .args(&args)
         .status()
         .context("failed to run rclone")?;
 
@@ -476,15 +617,19 @@ pub fn sync_photos_up(config: &Config) -> Result<()> {
     Ok(())
 }
 
-pub fn sync_lightroom_up(config: &Config) -> Result<()> {
+pub fn sync_lightroom_up(local: &Path, remote: &str, backend: &Backend) -> Result<()> {
+    let mut args = vec![
+        "sync".to_string(),
+        local.to_str().unwrap().to_string(),
+        remote.to_string(),
+        "--progress".to_string(),
+        "--transfers".to_string(), "4".to_string(),
+    ];
+    if backend.needs_b2_chunk_flag() {
+        args.extend(["--b2-chunk-size".into(), "96M".into()]);
+    }
     let status = Command::new("rclone")
-        .args([
-            "sync",
-            config.local_lightroom.to_str().unwrap(),
-            &config.lightroom_remote,
-            "--progress",
-            "--transfers", "4",
-        ])
+        .args(&args)
         .status()
         .context("failed to run rclone")?;
 
@@ -494,15 +639,19 @@ pub fn sync_lightroom_up(config: &Config) -> Result<()> {
     Ok(())
 }
 
-pub fn sync_lightroom_down(config: &Config) -> Result<()> {
+pub fn sync_lightroom_down(remote: &str, local: &Path, backend: &Backend) -> Result<()> {
+    let mut args = vec![
+        "sync".to_string(),
+        remote.to_string(),
+        local.to_str().unwrap().to_string(),
+        "--progress".to_string(),
+        "--transfers".to_string(), "4".to_string(),
+    ];
+    if backend.needs_b2_chunk_flag() {
+        args.extend(["--b2-chunk-size".into(), "96M".into()]);
+    }
     let status = Command::new("rclone")
-        .args([
-            "sync",
-            &config.lightroom_remote,
-            config.local_lightroom.to_str().unwrap(),
-            "--progress",
-            "--transfers", "4",
-        ])
+        .args(&args)
         .status()
         .context("failed to run rclone")?;
 
