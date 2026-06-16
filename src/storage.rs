@@ -239,6 +239,35 @@ pub fn save_metadata(remote_path: &str, metadata: &Metadata) -> Result<()> {
     Ok(())
 }
 
+/// Scans a shoot's local directory (including raw/ and jpeg/ subdirs) for photo source files.
+/// Prefers JPEG over CR2 for the same filename stem to avoid RAW decode overhead.
+fn collect_photo_sources(local: &Path) -> Result<HashMap<String, std::path::PathBuf>> {
+    let mut sources: HashMap<String, std::path::PathBuf> = HashMap::new();
+    let search_dirs = [local.to_path_buf(), local.join("raw"), local.join("jpeg")];
+    for dir in &search_dirs {
+        if !dir.exists() { continue; }
+        for entry in std::fs::read_dir(dir)? {
+            let entry = entry?;
+            let path = entry.path();
+            if !path.is_file() { continue; }
+            let ext = path.extension()
+                .and_then(|e| e.to_str())
+                .unwrap_or("")
+                .to_lowercase();
+            if !matches!(ext.as_str(), "cr2" | "jpg" | "jpeg") { continue; }
+            let stem = path.file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or("")
+                .to_string();
+            let is_jpeg = matches!(ext.as_str(), "jpg" | "jpeg");
+            if is_jpeg || !sources.contains_key(&stem) {
+                sources.insert(stem, path);
+            }
+        }
+    }
+    Ok(sources)
+}
+
 /// Generates JPEG previews from local shoot files and uploads them to the given remote.
 /// Prefers JPEG source over CR2 for the same filename stem to avoid RAW decode overhead.
 pub fn generate_and_upload_previews(
@@ -256,25 +285,7 @@ pub fn generate_and_upload_previews(
         .join(&shoot.name);
     std::fs::create_dir_all(&preview_dir)?;
 
-    let mut sources: HashMap<String, std::path::PathBuf> = HashMap::new();
-    for entry in std::fs::read_dir(local)? {
-        let entry = entry?;
-        let path = entry.path();
-        if !path.is_file() { continue; }
-        let ext = path.extension()
-            .and_then(|e| e.to_str())
-            .unwrap_or("")
-            .to_lowercase();
-        if !matches!(ext.as_str(), "cr2" | "jpg" | "jpeg") { continue; }
-        let stem = path.file_stem()
-            .and_then(|s| s.to_str())
-            .unwrap_or("")
-            .to_string();
-        let is_jpeg = matches!(ext.as_str(), "jpg" | "jpeg");
-        if is_jpeg || !sources.contains_key(&stem) {
-            sources.insert(stem, path);
-        }
-    }
+    let sources = collect_photo_sources(local)?;
 
     if sources.is_empty() {
         anyhow::bail!("no CR2 or JPEG files found in {}", local.display());
@@ -512,6 +523,161 @@ pub enum DownloadFilter {
     RawOnly,
     JpegOnly,
     Both,
+}
+
+#[derive(Debug, PartialEq)]
+pub enum ShootLayout {
+    Flat,
+    Split,
+}
+
+/// Returns Split if the local shoot directory already has raw/ or jpeg/ subdirectories.
+pub fn detect_local_layout(local: &Path) -> ShootLayout {
+    if local.join("raw").exists() || local.join("jpeg").exists() {
+        ShootLayout::Split
+    } else {
+        ShootLayout::Flat
+    }
+}
+
+/// Returns Split if the remote shoot directory has raw/ or jpeg/ as top-level subdirectories.
+pub fn detect_remote_layout(remote: &str) -> ShootLayout {
+    let output = Command::new("rclone")
+        .args(["lsjson", "--dirs-only", remote])
+        .stderr(Stdio::null())
+        .output();
+
+    match output {
+        Ok(o) if o.status.success() => {
+            let entries: Vec<RcloneLsEntry> =
+                serde_json::from_slice(&o.stdout).unwrap_or_default();
+            if entries.iter().any(|e| e.is_dir && (e.path == "raw" || e.path == "jpeg")) {
+                ShootLayout::Split
+            } else {
+                ShootLayout::Flat
+            }
+        }
+        _ => ShootLayout::Flat,
+    }
+}
+
+/// Reorganises a shoot from a flat layout into raw/ and jpeg/ subdirectories.
+/// Migrates the local copy first (if present), then each remote tier.
+/// Already-split tiers are skipped so the operation is idempotent.
+pub fn migrate_shoot_to_split(
+    local: Option<&Path>,
+    remotes: &[(&str, &Backend)],
+) -> Result<()> {
+    let mut any_work = false;
+
+    if let Some(local_path) = local {
+        if local_path.exists() && detect_local_layout(local_path) == ShootLayout::Flat {
+            println!("  Migrating local copy...");
+            let raw_dir  = local_path.join("raw");
+            let jpeg_dir = local_path.join("jpeg");
+
+            let mut to_move: Vec<(std::path::PathBuf, std::path::PathBuf)> = vec![];
+            for entry in std::fs::read_dir(local_path)? {
+                let entry = entry?;
+                let path = entry.path();
+                if !path.is_file() { continue; }
+                let ext = path.extension()
+                    .and_then(|e| e.to_str())
+                    .unwrap_or("")
+                    .to_lowercase();
+                let dest_dir = match ext.as_str() {
+                    "cr2"        => &raw_dir,
+                    "jpg" | "jpeg" => &jpeg_dir,
+                    _ => continue,
+                };
+                let filename = path.file_name().unwrap().to_owned();
+                to_move.push((path, dest_dir.join(filename)));
+            }
+
+            let mut needed_dirs: std::collections::HashSet<std::path::PathBuf> =
+                std::collections::HashSet::new();
+            for (_, dst) in &to_move {
+                needed_dirs.insert(dst.parent().unwrap().to_path_buf());
+            }
+            for dir in &needed_dirs {
+                std::fs::create_dir_all(dir)?;
+            }
+            for (src, dst) in to_move {
+                std::fs::rename(&src, &dst)
+                    .with_context(|| format!("failed to move {}", src.display()))?;
+            }
+            println!("  Local copy migrated.");
+            any_work = true;
+        } else if local_path.exists() {
+            println!("  Local copy already uses split layout, skipping.");
+        }
+    }
+
+    for (remote, backend) in remotes {
+        if detect_remote_layout(remote) == ShootLayout::Flat {
+            println!("  Migrating remote: {}", remote);
+
+            // Move CR2 files into raw/. Excludes are listed before includes so already-moved
+            // files in raw/ are skipped on a re-run (filters are evaluated first-match-wins).
+            let raw_remote  = format!("{}/raw",  remote);
+            let jpeg_remote = format!("{}/jpeg", remote);
+
+            let mut raw_args = vec![
+                "move".to_string(), remote.to_string(), raw_remote,
+                "--exclude".to_string(), "raw/**".to_string(),
+                "--exclude".to_string(), "jpeg/**".to_string(),
+                "--exclude".to_string(), "previews/**".to_string(),
+                "--exclude".to_string(), "shoot.json".to_string(),
+                "--include".to_string(), "*.CR2".to_string(),
+                "--include".to_string(), "*.cr2".to_string(),
+                "--progress".to_string(),
+            ];
+            if backend.needs_b2_chunk_flag() {
+                raw_args.extend(["--b2-chunk-size".into(), "96M".into()]);
+            }
+            let status = Command::new("rclone")
+                .args(&raw_args)
+                .status()
+                .context("failed to run rclone move (RAW)")?;
+            if !status.success() {
+                anyhow::bail!("failed to move RAW files on {}", remote);
+            }
+
+            let mut jpeg_args = vec![
+                "move".to_string(), remote.to_string(), jpeg_remote,
+                "--exclude".to_string(), "raw/**".to_string(),
+                "--exclude".to_string(), "jpeg/**".to_string(),
+                "--exclude".to_string(), "previews/**".to_string(),
+                "--exclude".to_string(), "shoot.json".to_string(),
+                "--include".to_string(), "*.jpg".to_string(),
+                "--include".to_string(), "*.JPG".to_string(),
+                "--include".to_string(), "*.jpeg".to_string(),
+                "--include".to_string(), "*.JPEG".to_string(),
+                "--progress".to_string(),
+            ];
+            if backend.needs_b2_chunk_flag() {
+                jpeg_args.extend(["--b2-chunk-size".into(), "96M".into()]);
+            }
+            let status = Command::new("rclone")
+                .args(&jpeg_args)
+                .status()
+                .context("failed to run rclone move (JPEG)")?;
+            if !status.success() {
+                anyhow::bail!("failed to move JPEG files on {}", remote);
+            }
+
+            println!("  Remote migrated.");
+            any_work = true;
+        } else {
+            println!("  Remote already uses split layout, skipping.");
+        }
+    }
+
+    if !any_work {
+        println!("  Shoot is already using split structure everywhere.");
+    }
+
+    Ok(())
 }
 
 pub fn download_shoot(
