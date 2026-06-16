@@ -3,6 +3,10 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::Path;
 use std::process::{Command, Stdio};
+use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::thread;
+use std::time::Duration;
 
 use crate::config::{Backend, Config, Tier};
 
@@ -239,6 +243,35 @@ pub fn save_metadata(remote_path: &str, metadata: &Metadata) -> Result<()> {
     Ok(())
 }
 
+/// Scans a shoot's local directory (including raw/ and jpeg/ subdirs) for photo source files.
+/// Prefers JPEG over CR2 for the same filename stem to avoid RAW decode overhead.
+fn collect_photo_sources(local: &Path) -> Result<HashMap<String, std::path::PathBuf>> {
+    let mut sources: HashMap<String, std::path::PathBuf> = HashMap::new();
+    let search_dirs = [local.to_path_buf(), local.join("raw"), local.join("jpeg")];
+    for dir in &search_dirs {
+        if !dir.exists() { continue; }
+        for entry in std::fs::read_dir(dir)? {
+            let entry = entry?;
+            let path = entry.path();
+            if !path.is_file() { continue; }
+            let ext = path.extension()
+                .and_then(|e| e.to_str())
+                .unwrap_or("")
+                .to_lowercase();
+            if !matches!(ext.as_str(), "cr2" | "jpg" | "jpeg") { continue; }
+            let stem = path.file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or("")
+                .to_string();
+            let is_jpeg = matches!(ext.as_str(), "jpg" | "jpeg");
+            if is_jpeg || !sources.contains_key(&stem) {
+                sources.insert(stem, path);
+            }
+        }
+    }
+    Ok(sources)
+}
+
 /// Generates JPEG previews from local shoot files and uploads them to the given remote.
 /// Prefers JPEG source over CR2 for the same filename stem to avoid RAW decode overhead.
 pub fn generate_and_upload_previews(
@@ -256,25 +289,7 @@ pub fn generate_and_upload_previews(
         .join(&shoot.name);
     std::fs::create_dir_all(&preview_dir)?;
 
-    let mut sources: HashMap<String, std::path::PathBuf> = HashMap::new();
-    for entry in std::fs::read_dir(local)? {
-        let entry = entry?;
-        let path = entry.path();
-        if !path.is_file() { continue; }
-        let ext = path.extension()
-            .and_then(|e| e.to_str())
-            .unwrap_or("")
-            .to_lowercase();
-        if !matches!(ext.as_str(), "cr2" | "jpg" | "jpeg") { continue; }
-        let stem = path.file_stem()
-            .and_then(|s| s.to_str())
-            .unwrap_or("")
-            .to_string();
-        let is_jpeg = matches!(ext.as_str(), "jpg" | "jpeg");
-        if is_jpeg || !sources.contains_key(&stem) {
-            sources.insert(stem, path);
-        }
-    }
+    let sources = collect_photo_sources(local)?;
 
     if sources.is_empty() {
         anyhow::bail!("no CR2 or JPEG files found in {}", local.display());
@@ -512,6 +527,186 @@ pub enum DownloadFilter {
     RawOnly,
     JpegOnly,
     Both,
+}
+
+#[derive(Debug, PartialEq)]
+pub enum ShootLayout {
+    Flat,
+    Split,
+}
+
+/// Returns Split if the local shoot directory already has raw/ or jpeg/ subdirectories.
+pub fn detect_local_layout(local: &Path) -> ShootLayout {
+    if local.join("raw").exists() || local.join("jpeg").exists() {
+        ShootLayout::Split
+    } else {
+        ShootLayout::Flat
+    }
+}
+
+
+/// Reorganises a shoot from a flat layout into raw/ and jpeg/ subdirectories.
+/// Migrates the local copy first (if present), then each remote tier.
+/// Already-split tiers are skipped so the operation is idempotent.
+pub fn migrate_shoot_to_split(
+    local: Option<&Path>,
+    remotes: &[(&str, &Backend)],
+) -> Result<()> {
+    let mut any_work = false;
+
+    if let Some(local_path) = local {
+        if local_path.exists() && detect_local_layout(local_path) == ShootLayout::Flat {
+            println!("  Migrating local copy...");
+            let raw_dir  = local_path.join("raw");
+            let jpeg_dir = local_path.join("jpeg");
+
+            let mut to_move: Vec<(std::path::PathBuf, std::path::PathBuf)> = vec![];
+            for entry in std::fs::read_dir(local_path)? {
+                let entry = entry?;
+                let path = entry.path();
+                if !path.is_file() { continue; }
+                let ext = path.extension()
+                    .and_then(|e| e.to_str())
+                    .unwrap_or("")
+                    .to_lowercase();
+                let dest_dir = match ext.as_str() {
+                    "cr2"        => &raw_dir,
+                    "jpg" | "jpeg" => &jpeg_dir,
+                    _ => continue,
+                };
+                let filename = path.file_name().unwrap().to_owned();
+                to_move.push((path, dest_dir.join(filename)));
+            }
+
+            let mut needed_dirs: std::collections::HashSet<std::path::PathBuf> =
+                std::collections::HashSet::new();
+            for (_, dst) in &to_move {
+                needed_dirs.insert(dst.parent().unwrap().to_path_buf());
+            }
+            for dir in &needed_dirs {
+                std::fs::create_dir_all(dir)?;
+            }
+            for (src, dst) in to_move {
+                std::fs::rename(&src, &dst)
+                    .with_context(|| format!("failed to move {}", src.display()))?;
+            }
+            println!("  Local copy migrated.");
+            any_work = true;
+        } else if local_path.exists() {
+            println!("  Local copy already uses split layout, skipping.");
+        }
+    }
+
+    for (remote, backend) in remotes {
+        // List direct children of the shoot directory (non-recursive, files and dirs).
+        let output = Command::new("rclone")
+            .args(["lsjson", remote])
+            .stderr(Stdio::null())
+            .output()
+            .context("failed to list remote files")?;
+        if !output.status.success() {
+            anyhow::bail!("failed to list files on {}", remote);
+        }
+        let entries: Vec<RcloneLsEntry> = serde_json::from_slice(&output.stdout)
+            .context("failed to parse rclone lsjson")?;
+
+        // Collect root-level photo files and where they should go.
+        // Dirs (raw/, jpeg/, previews/) are is_dir=true and filtered out.
+        let to_move: Vec<(String, &'static str)> = entries.iter()
+            .filter(|e| !e.is_dir)
+            .filter_map(|e| {
+                let ext = std::path::Path::new(&e.path)
+                    .extension()?
+                    .to_str()?
+                    .to_ascii_lowercase();
+                let subdir = match ext.as_str() {
+                    "cr2"          => "raw",
+                    "jpg" | "jpeg" => "jpeg",
+                    _ => return None,
+                };
+                Some((e.path.clone(), subdir))
+            })
+            .collect();
+
+        if to_move.is_empty() {
+            println!("  Remote already uses split layout, skipping.");
+            continue;
+        }
+
+        // Use per-file moveto so source and destination never overlap (rclone move
+        // refuses when dst is a subdirectory of src). moveto is a server-side rename
+        // on both OneDrive and B2, so no bytes are transferred.
+        let total      = to_move.len();
+        let to_move    = Arc::new(to_move);
+        let next_idx   = Arc::new(AtomicUsize::new(0));
+        let completed  = Arc::new(AtomicUsize::new(0));
+        let first_err: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+
+        let handles: Vec<_> = (0..8usize.min(total)).map(|_| {
+            let to_move   = Arc::clone(&to_move);
+            let next_idx  = Arc::clone(&next_idx);
+            let completed = Arc::clone(&completed);
+            let first_err = Arc::clone(&first_err);
+            let remote    = remote.to_string();
+            let needs_b2  = backend.needs_b2_chunk_flag();
+            thread::spawn(move || {
+                loop {
+                    if first_err.lock().unwrap().is_some() { break; }
+                    let idx = next_idx.fetch_add(1, Ordering::Relaxed);
+                    if idx >= to_move.len() { break; }
+                    let (filename, subdir) = &to_move[idx];
+                    let src = format!("{}/{}", remote, filename);
+                    let dst = format!("{}/{}/{}", remote, subdir, filename);
+                    let mut args = vec!["moveto".to_string(), src, dst];
+                    if needs_b2 { args.extend(["--b2-chunk-size".into(), "96M".into()]); }
+                    match Command::new("rclone").args(&args)
+                        .stdout(Stdio::null()).stderr(Stdio::piped()).output()
+                    {
+                        Ok(o) if o.status.success() => {
+                            completed.fetch_add(1, Ordering::Relaxed);
+                        }
+                        Ok(o) => {
+                            let mut err = first_err.lock().unwrap();
+                            if err.is_none() {
+                                *err = Some(format!("failed to move {}: {}",
+                                    filename, String::from_utf8_lossy(&o.stderr).trim()));
+                            }
+                            break;
+                        }
+                        Err(e) => {
+                            let mut err = first_err.lock().unwrap();
+                            if err.is_none() { *err = Some(format!("failed to spawn rclone: {e}")); }
+                            break;
+                        }
+                    }
+                }
+            })
+        }).collect();
+
+        loop {
+            let done   = completed.load(Ordering::Relaxed);
+            let pct    = done * 100 / total;
+            let filled = done * 20  / total;
+            let bar    = format!("[{}{}]", "=".repeat(filled), " ".repeat(20 - filled));
+            print!("\r  {} {:>3}%  ({}/{})", bar, pct, done, total);
+            let _ = std::io::Write::flush(&mut std::io::stdout());
+            if done >= total || first_err.lock().unwrap().is_some() { break; }
+            thread::sleep(Duration::from_millis(100));
+        }
+        for handle in handles { handle.join().ok(); }
+        if let Some(err) = first_err.lock().unwrap().take() {
+            println!();
+            anyhow::bail!("{}", err);
+        }
+        println!("\r{:<60}", format!("  {} files moved.", total));
+        any_work = true;
+    }
+
+    if !any_work {
+        println!("  Shoot is already using split structure everywhere.");
+    }
+
+    Ok(())
 }
 
 pub fn download_shoot(

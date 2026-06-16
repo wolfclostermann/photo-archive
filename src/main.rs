@@ -204,6 +204,7 @@ fn shoot_menu(config: &Config, shoot: &storage::Shoot) -> Result<Option<storage:
             options.push(format!("Remove from hot storage ({})", hot_label));
         }
 
+        options.push("Migrate to split structure".into());
         options.push("Delete".into());
         options.push("← Back".into());
 
@@ -245,6 +246,21 @@ fn shoot_menu(config: &Config, shoot: &storage::Shoot) -> Result<Option<storage:
                 match edit_metadata(shoot) {
                     Ok(meta) => return Ok(Some(meta)),
                     Err(e) => eprintln!("Error saving metadata: {e}"),
+                }
+            }
+            "Migrate to split structure" => {
+                let local_path = shoot.local_path(&config.local_photosets);
+                let local = if local_path.exists() { Some(local_path.as_path()) } else { None };
+                let hot_pair  = shoot.hot_path.as_deref()
+                    .zip(config.hot.as_ref().map(|bc| &bc.backend));
+                let cold_pair = shoot.cold_path.as_deref()
+                    .zip(config.cold.as_ref().map(|bc| &bc.backend));
+                let mut remotes: Vec<(&str, &config::Backend)> = vec![];
+                if let Some(p) = hot_pair  { remotes.push(p); }
+                if let Some(p) = cold_pair { remotes.push(p); }
+                match storage::migrate_shoot_to_split(local, &remotes) {
+                    Ok(_)  => println!("Done."),
+                    Err(e) => eprintln!("Error: {e}"),
                 }
             }
             "Delete" => {
