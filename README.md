@@ -1,4 +1,4 @@
-# photo-archive
+# shoot-manager
 
 A terminal UI for managing photography archives on Backblaze B2, built in Rust.
 
@@ -49,7 +49,7 @@ rclone config create b2 b2 account <keyID> key <applicationKey>
 cargo build --release
 
 # Run
-./target/release/photo-archive
+./target/release/shoot-manager
 ```
 
 ## B2 structure

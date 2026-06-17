@@ -62,8 +62,8 @@ impl Shoot {
         self.active_remote().map(|r| format!("{}/previews", r))
     }
 
-    pub fn local_path(&self, local_photosets: &Path) -> std::path::PathBuf {
-        local_photosets.join(&self.year).join(&self.name)
+    pub fn local_path(&self, local_shoots: &Path) -> std::path::PathBuf {
+        local_shoots.join(&self.year).join(&self.name)
     }
 
     pub fn display_name(&self) -> String {
@@ -228,7 +228,7 @@ pub fn fetch_metadata(remote_path: &str) -> Option<Metadata> {
 
 pub fn save_metadata(remote_path: &str, metadata: &Metadata) -> Result<()> {
     let json = serde_json::to_string_pretty(metadata)?;
-    let tmp = std::env::temp_dir().join("photo-archive-shoot.json");
+    let tmp = std::env::temp_dir().join("shoot-manager-shoot.json");
     std::fs::write(&tmp, json)?;
 
     let dest = format!("{}/shoot.json", remote_path);
@@ -285,7 +285,7 @@ pub fn generate_and_upload_previews(
     }
 
     let preview_dir = std::env::temp_dir()
-        .join("photo-archive-previews")
+        .join("shoot-manager-previews")
         .join(&shoot.name);
     std::fs::create_dir_all(&preview_dir)?;
 
@@ -382,7 +382,7 @@ pub fn browse_previews(shoot_name: &str, previews_remote: &str) -> Result<()> {
     }
 
     let preview_dir = std::env::temp_dir()
-        .join("photo-archive-previews")
+        .join("shoot-manager-previews")
         .join(shoot_name);
     std::fs::create_dir_all(&preview_dir)?;
 
@@ -789,7 +789,7 @@ pub fn copy_remote_to_remote(
     Ok(())
 }
 
-/// Syncs local photosets directory up to a remote.
+/// Syncs local shoots directory up to a remote.
 pub fn sync_up(local: &Path, remote: &str, backend: &Backend) -> Result<()> {
     let mut args = vec![
         "copy".to_string(),

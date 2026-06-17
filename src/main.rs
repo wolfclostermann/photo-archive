@@ -1,9 +1,12 @@
 mod config;
+mod importer;
+mod menu;
+mod scanner;
 mod storage;
 
 use anyhow::Result;
 use config::{Config, Tier};
-use inquire::{Confirm, Select, Text};
+use inquire::{Confirm, MultiSelect, Text};
 use std::thread;
 
 fn main() -> Result<()> {
@@ -15,10 +18,10 @@ fn main() -> Result<()> {
 fn ensure_hot_dirs(config: &Config) -> Result<()> {
     let Some(hot) = &config.hot else { return Ok(()) };
 
-    if !storage::remote_exists(&hot.photosets_remote) {
+    if !storage::remote_exists(&hot.shoots_remote) {
         println!(
             "Hot storage directory does not exist: {}",
-            hot.photosets_remote
+            hot.shoots_remote
         );
         let create = Confirm::new(&format!(
             "Create it on {}?",
@@ -27,7 +30,7 @@ fn ensure_hot_dirs(config: &Config) -> Result<()> {
         .with_default(true)
         .prompt()?;
         if create {
-            storage::create_remote_dir(&hot.photosets_remote)?;
+            storage::create_remote_dir(&hot.shoots_remote)?;
             println!("Created.");
         } else {
             anyhow::bail!("hot storage directory is required to continue");
@@ -39,22 +42,31 @@ fn ensure_hot_dirs(config: &Config) -> Result<()> {
 
 fn main_menu(config: &Config) -> Result<()> {
     loop {
-        let choice = Select::new(
-            "Photo Archive Manager",
-            vec![
+        let choice = match menu::select(
+            "Photoshoot Manager",
+            &[
                 "Browse & download photoshoots",
+                "Import from card",
                 "Sync all photos up",
                 "Generate missing previews",
                 "Purge local copies",
                 "Lightroom library sync",
                 "Quit",
             ],
-        )
-        .prompt()?;
+        )? {
+            menu::Choice::Quit => break,
+            menu::Choice::Back => continue,
+            menu::Choice::Select(s) => s,
+        };
 
-        match choice {
+        match choice.as_str() {
             "Browse & download photoshoots" => {
                 if let Err(e) = browse_menu(config) {
+                    eprintln!("Error: {e}");
+                }
+            }
+            "Import from card" => {
+                if let Err(e) = import_from_card(config) {
                     eprintln!("Error: {e}");
                 }
             }
@@ -87,11 +99,11 @@ fn main_menu(config: &Config) -> Result<()> {
 
 fn list_all_shoots(config: &Config) -> Result<Vec<storage::Shoot>> {
     let hot_shoots = match &config.hot {
-        Some(bc) => storage::list_shoots_from(&bc.photosets_remote, &Tier::Hot)?,
+        Some(bc) => storage::list_shoots_from(&bc.shoots_remote, &Tier::Hot)?,
         None => vec![],
     };
     let cold_shoots = match &config.cold {
-        Some(bc) => storage::list_shoots_from(&bc.photosets_remote, &Tier::Cold)?,
+        Some(bc) => storage::list_shoots_from(&bc.shoots_remote, &Tier::Cold)?,
         None => vec![],
     };
     Ok(storage::merge_shoot_lists(hot_shoots, cold_shoots))
@@ -134,11 +146,11 @@ fn browse_menu(config: &Config) -> Result<()> {
         let mut options: Vec<String> = shoots.iter().map(|s| s.display_name()).collect();
         options.push("← Back".into());
 
-        let choice = Select::new("Select a photoshoot:", options.clone()).prompt()?;
-
-        if choice == "← Back" {
-            break;
-        }
+        let choice = match menu::select("Select a photoshoot:", &options)? {
+            menu::Choice::Quit | menu::Choice::Back => break,
+            menu::Choice::Select(s) if s == "← Back" => break,
+            menu::Choice::Select(s) => s,
+        };
 
         if let Some(idx) = shoots.iter().position(|s| s.display_name() == choice) {
             let updated = shoot_menu(config, &shoots[idx])?;
@@ -208,7 +220,10 @@ fn shoot_menu(config: &Config, shoot: &storage::Shoot) -> Result<Option<storage:
         options.push("Delete".into());
         options.push("← Back".into());
 
-        let choice = Select::new("Options:", options).prompt()?;
+        let choice = match menu::select("Options:", &options)? {
+            menu::Choice::Quit | menu::Choice::Back => break,
+            menu::Choice::Select(s) => s,
+        };
 
         match choice.as_str() {
             "Download" => {
@@ -226,7 +241,7 @@ fn shoot_menu(config: &Config, shoot: &storage::Shoot) -> Result<Option<storage:
                 }
             }
             "Generate previews" => {
-                let local = shoot.local_path(&config.local_photosets);
+                let local = shoot.local_path(&config.local_shoots);
                 if let (Some(active), Some(backend)) = (shoot.active_remote(), shoot.active_backend(config)) {
                     let upload_remote = format!("{}/previews", active);
                     match storage::generate_and_upload_previews(shoot, &local, &upload_remote, backend) {
@@ -249,7 +264,7 @@ fn shoot_menu(config: &Config, shoot: &storage::Shoot) -> Result<Option<storage:
                 }
             }
             "Migrate to split structure" => {
-                let local_path = shoot.local_path(&config.local_photosets);
+                let local_path = shoot.local_path(&config.local_shoots);
                 let local = if local_path.exists() { Some(local_path.as_path()) } else { None };
                 let hot_pair  = shoot.hot_path.as_deref()
                     .zip(config.hot.as_ref().map(|bc| &bc.backend));
@@ -272,7 +287,7 @@ fn shoot_menu(config: &Config, shoot: &storage::Shoot) -> Result<Option<storage:
                 if let (Some(hot_path), Some(cold_bc)) = (&shoot.hot_path, &config.cold) {
                     let cold_path = format!(
                         "{}/{}/{}",
-                        cold_bc.photosets_remote, shoot.year, shoot.name
+                        cold_bc.shoots_remote, shoot.year, shoot.name
                     );
                     println!("Archiving {} to {}...", shoot.name, cold_bc.backend.label());
                     match storage::copy_remote_to_remote(hot_path, &cold_path, &cold_bc.backend, true) {
@@ -285,7 +300,7 @@ fn shoot_menu(config: &Config, shoot: &storage::Shoot) -> Result<Option<storage:
                 if let (Some(cold_path), Some(hot_bc)) = (&shoot.cold_path, &config.hot) {
                     let hot_path = format!(
                         "{}/{}/{}",
-                        hot_bc.photosets_remote, shoot.year, shoot.name
+                        hot_bc.shoots_remote, shoot.year, shoot.name
                     );
                     println!("Restoring {} to {}...", shoot.name, hot_bc.backend.label());
                     match storage::copy_remote_to_remote(cold_path, &hot_path, &hot_bc.backend, false) {
@@ -343,7 +358,11 @@ fn shoot_delete_menu(config: &Config, shoot: &storage::Shoot) -> Result<bool> {
             "Delete from both".to_string(),
             "← Back".to_string(),
         ];
-        let choice = Select::new("Delete from:", options).prompt()?;
+        let choice = match menu::select("Delete from:", &options)? {
+            menu::Choice::Quit | menu::Choice::Back => return Ok(false),
+            menu::Choice::Select(s) if s == "← Back" => return Ok(false),
+            menu::Choice::Select(s) => s,
+        };
 
         match choice.as_str() {
             s if s.starts_with(&format!("Delete from {} (hot)", hot_label)) => {
@@ -429,7 +448,7 @@ fn download_menu(config: &Config, shoot: &storage::Shoot) -> Result<()> {
         anyhow::bail!("shoot has no remote path");
     };
 
-    let local = shoot.local_path(&config.local_photosets);
+    let local = shoot.local_path(&config.local_shoots);
     let status = storage::check_local_status(&local, remote_path);
     let status_str = match &status {
         storage::LocalStatus::NotDownloaded => "not downloaded",
@@ -445,13 +464,15 @@ fn download_menu(config: &Config, shoot: &storage::Shoot) -> Result<()> {
         if !proceed { return Ok(()); }
     }
 
-    let choice = Select::new(
+    let choice = match menu::select(
         "Download:",
-        vec!["RAW only (.CR2)", "JPEG only (.jpg)", "Both", "← Back"],
-    )
-    .prompt()?;
+        &["RAW only (.CR2)", "JPEG only (.jpg)", "Both", "← Back"],
+    )? {
+        menu::Choice::Quit | menu::Choice::Back => return Ok(()),
+        menu::Choice::Select(s) => s,
+    };
 
-    let filter = match choice {
+    let filter = match choice.as_str() {
         "RAW only (.CR2)"  => storage::DownloadFilter::RawOnly,
         "JPEG only (.jpg)" => storage::DownloadFilter::JpegOnly,
         "Both"             => storage::DownloadFilter::Both,
@@ -498,7 +519,7 @@ fn sync_all_up(config: &Config) -> Result<()> {
 
     if let Some(hot) = &config.hot {
         println!("Syncing to {} (hot)...", hot.backend.label());
-        if let Err(e) = storage::sync_up(&config.local_photosets, &hot.photosets_remote, &hot.backend) {
+        if let Err(e) = storage::sync_up(&config.local_shoots, &hot.shoots_remote, &hot.backend) {
             eprintln!("Error syncing to {}: {e}", hot.backend.label());
             any_error = true;
         }
@@ -506,7 +527,7 @@ fn sync_all_up(config: &Config) -> Result<()> {
 
     if let Some(cold) = &config.cold {
         println!("Syncing to {} (cold)...", cold.backend.label());
-        if let Err(e) = storage::sync_up(&config.local_photosets, &cold.photosets_remote, &cold.backend) {
+        if let Err(e) = storage::sync_up(&config.local_shoots, &cold.shoots_remote, &cold.backend) {
             eprintln!("Error syncing to {}: {e}", cold.backend.label());
             any_error = true;
         }
@@ -531,7 +552,7 @@ fn generate_missing_previews(config: &Config) -> Result<()> {
     let missing: Vec<&storage::Shoot> = shoots
         .iter()
         .filter(|s| {
-            let has_local = s.local_path(&config.local_photosets).exists();
+            let has_local = s.local_path(&config.local_shoots).exists();
             let has_previews = s.previews_remote()
                 .map(|pr| storage::previews_exist(&pr))
                 .unwrap_or(false);
@@ -551,7 +572,7 @@ fn generate_missing_previews(config: &Config) -> Result<()> {
 
     for (i, shoot) in missing.iter().enumerate() {
         println!("\n[{}/{}] {}", i + 1, missing.len(), shoot.name);
-        let local = shoot.local_path(&config.local_photosets);
+        let local = shoot.local_path(&config.local_shoots);
         if let (Some(active), Some(backend)) = (shoot.active_remote(), shoot.active_backend(config)) {
             let upload_remote = format!("{}/previews", active);
             match storage::generate_and_upload_previews(shoot, &local, &upload_remote, backend) {
@@ -566,7 +587,7 @@ fn generate_missing_previews(config: &Config) -> Result<()> {
 }
 
 fn purge_single(config: &Config, shoot: &storage::Shoot) -> Result<()> {
-    let local = shoot.local_path(&config.local_photosets);
+    let local = shoot.local_path(&config.local_shoots);
     if !local.exists() {
         println!("  {} is not downloaded locally.", shoot.name);
         return Ok(());
@@ -614,7 +635,7 @@ fn purge_local_menu(config: &Config) -> Result<()> {
 
     let local_shoots: Vec<&storage::Shoot> = shoots
         .iter()
-        .filter(|s| s.local_path(&config.local_photosets).exists())
+        .filter(|s| s.local_path(&config.local_shoots).exists())
         .collect();
 
     if local_shoots.is_empty() {
@@ -640,7 +661,7 @@ fn purge_local_menu(config: &Config) -> Result<()> {
 
         let remote = shoot.cold_path.as_deref().or_else(|| shoot.hot_path.as_deref());
         let result = match remote {
-            Some(r) => storage::verify_local_synced(&shoot.local_path(&config.local_photosets), r),
+            Some(r) => storage::verify_local_synced(&shoot.local_path(&config.local_shoots), r),
             None => Ok(false),
         };
 
@@ -686,13 +707,147 @@ fn purge_local_menu(config: &Config) -> Result<()> {
 
     for shoot in &synced {
         print!("  Deleting {} ... ", shoot.name);
-        match storage::purge_local(&shoot.local_path(&config.local_photosets)) {
+        match storage::purge_local(&shoot.local_path(&config.local_shoots)) {
             Ok(_) => println!("done"),
             Err(e) => println!("FAILED: {e}"),
         }
     }
 
     println!("Purge complete.");
+    Ok(())
+}
+
+fn import_from_card(config: &Config) -> Result<()> {
+    let all_drives = scanner::find_external_drives();
+    let cards: Vec<_> = all_drives
+        .into_iter()
+        .filter(|d| d.path.join("DCIM").exists())
+        .collect();
+
+    if cards.is_empty() {
+        println!("No camera cards found (no external drives with a DCIM folder).");
+        return Ok(());
+    }
+
+    let drive = if cards.len() == 1 {
+        println!("Found card: {}", cards[0].display_name());
+        cards.into_iter().next().unwrap()
+    } else {
+        let names: Vec<String> = cards.iter().map(|d| d.display_name()).collect();
+        let name = match menu::select("Select card:", &names)? {
+            menu::Choice::Quit | menu::Choice::Back => return Ok(()),
+            menu::Choice::Select(s) => s,
+        };
+        cards.into_iter().find(|d| d.display_name() == name).unwrap()
+    };
+
+    println!("Scanning {}...", drive.display_name());
+    let shoots = match scanner::scan_for_shoots(&drive) {
+        Ok(ps) => ps,
+        Err(e) => {
+            eprintln!("Error: {e}");
+            return Ok(());
+        }
+    };
+
+    if shoots.is_empty() {
+        println!("No image files found on this card.");
+        return Ok(());
+    }
+
+    const IMPORT_ALL: &str = "← Import all";
+    let mut options: Vec<String> = vec![IMPORT_ALL.to_string()];
+    options.extend(shoots.iter().map(|p| p.display_name()));
+
+    let selections = MultiSelect::new("Select shoots to import:", options).prompt()?;
+
+    let selected: Vec<&scanner::Shoot> = if selections.iter().any(|s| s == IMPORT_ALL) {
+        shoots.iter().collect()
+    } else {
+        shoots
+            .iter()
+            .filter(|p| selections.contains(&p.display_name()))
+            .collect()
+    };
+
+    if selected.is_empty() {
+        println!("Nothing selected.");
+        return Ok(());
+    }
+
+    println!("\nWill import:");
+    for p in &selected {
+        let dest = config.local_shoots
+            .join(p.date.format("%Y").to_string())
+            .join(p.date.format("%Y-%m-%d").to_string());
+        println!("  {}  →  {}", p.date, dest.display());
+    }
+    println!();
+
+    let confirm = Confirm::new("Proceed with import?")
+        .with_default(true)
+        .prompt()?;
+    if !confirm {
+        return Ok(());
+    }
+
+    let mut total_copied = 0usize;
+    let mut total_skipped = 0usize;
+    for shoot in &selected {
+        println!("\n{}", shoot.display_name());
+        match importer::import_shoot(shoot, &config.local_shoots) {
+            Ok(result) => {
+                println!(
+                    "  Done — {} copied, {} already present.",
+                    result.copied, result.skipped
+                );
+                total_copied += result.copied;
+                total_skipped += result.skipped;
+            }
+            Err(e) => eprintln!("  Error: {e}"),
+        }
+    }
+
+    println!("\nImport complete — {} copied, {} skipped.", total_copied, total_skipped);
+
+    let delete = Confirm::new("Delete imported files from card?")
+        .with_default(false)
+        .prompt()?;
+    if !delete {
+        return Ok(());
+    }
+
+    println!("Verifying...");
+    let mut any_missing = false;
+    for shoot in &selected {
+        let missing = importer::verify_import(shoot, &config.local_shoots)?;
+        if !missing.is_empty() {
+            eprintln!(
+                "  {} file(s) failed to verify for {}:",
+                missing.len(),
+                shoot.date
+            );
+            for f in &missing {
+                eprintln!("    {}", f.display());
+            }
+            any_missing = true;
+        }
+    }
+
+    if any_missing {
+        eprintln!("Deletion aborted — not all files verified.");
+        return Ok(());
+    }
+
+    println!("Verified. Deleting from card...");
+    for shoot in &selected {
+        match importer::delete_from_card(shoot) {
+            Ok(n) => println!("  Deleted {} file(s) for {}.", n, shoot.date),
+            Err(e) => eprintln!("  Error deleting {}: {e}", shoot.date),
+        }
+    }
+    println!("Done.");
+
     Ok(())
 }
 
@@ -709,17 +864,19 @@ fn lightroom_menu(config: &Config) -> Result<()> {
     let tier = if config.hot.is_some() { "hot" } else { "cold" };
 
     loop {
-        let choice = Select::new(
+        let choice = match menu::select(
             &format!("Lightroom Library Sync ({}, {}):", bc.backend.label(), tier),
-            vec![
+            &[
                 "Sync up  (local → remote)",
                 "Sync down  (remote → local)",
                 "← Back",
             ],
-        )
-        .prompt()?;
+        )? {
+            menu::Choice::Quit | menu::Choice::Back => break,
+            menu::Choice::Select(s) => s,
+        };
 
-        match choice {
+        match choice.as_str() {
             "Sync up  (local → remote)" => {
                 println!("Syncing Lightroom library to {}...", bc.backend.label());
                 match storage::sync_lightroom_up(&config.local_lightroom, &bc.lightroom_remote, &bc.backend) {

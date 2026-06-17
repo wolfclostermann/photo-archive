@@ -37,14 +37,14 @@ impl Backend {
 #[derive(Debug, Clone)]
 pub struct BackendConfig {
     pub backend: Backend,
-    pub photosets_remote: String,
+    pub shoots_remote: String,
     pub lightroom_remote: String,
 }
 
 pub struct Config {
     pub hot: Option<BackendConfig>,
     pub cold: Option<BackendConfig>,
-    pub local_photosets: PathBuf,
+    pub local_shoots: PathBuf,
     pub local_lightroom: PathBuf,
 }
 
@@ -53,31 +53,31 @@ impl Config {
         let _ = dotenvy::dotenv();
         let home = dirs::home_dir().expect("cannot find home directory");
 
-        let hot = env::var("ONEDRIVE_PHOTOSETS_REMOTE").ok().map(|photosets_remote| {
+        let hot = env::var("ONEDRIVE_REMOTE").ok().map(|shoots_remote| {
             let lightroom_remote = env::var("ONEDRIVE_LIGHTROOM_REMOTE")
-                .expect("ONEDRIVE_LIGHTROOM_REMOTE must be set when ONEDRIVE_PHOTOSETS_REMOTE is set");
-            BackendConfig { backend: Backend::OneDrive, photosets_remote, lightroom_remote }
+                .expect("ONEDRIVE_LIGHTROOM_REMOTE must be set when ONEDRIVE_REMOTE is set");
+            BackendConfig { backend: Backend::OneDrive, shoots_remote, lightroom_remote }
         });
 
-        let cold = env::var("B2_PHOTOSETS_REMOTE").ok().map(|photosets_remote| {
+        let cold = env::var("B2_REMOTE").ok().map(|shoots_remote| {
             let lightroom_remote = env::var("B2_LIGHTROOM_REMOTE")
-                .expect("B2_LIGHTROOM_REMOTE must be set when B2_PHOTOSETS_REMOTE is set");
-            BackendConfig { backend: Backend::B2, photosets_remote, lightroom_remote }
+                .expect("B2_LIGHTROOM_REMOTE must be set when B2_REMOTE is set");
+            BackendConfig { backend: Backend::B2, shoots_remote, lightroom_remote }
         });
 
         if hot.is_none() && cold.is_none() {
             panic!(
                 "No remote backends configured. \
-                Set ONEDRIVE_PHOTOSETS_REMOTE and/or B2_PHOTOSETS_REMOTE in .env"
+                Set ONEDRIVE_REMOTE and/or B2_REMOTE in .env"
             );
         }
 
         Self {
             hot,
             cold,
-            local_photosets: env::var("LOCAL_PHOTOSETS")
+            local_shoots: env::var("LOCAL_SHOOTS")
                 .map(PathBuf::from)
-                .unwrap_or_else(|_| home.join("Pictures/Photosets")),
+                .unwrap_or_else(|_| home.join("Pictures/Shoots")),
             local_lightroom: env::var("LOCAL_LIGHTROOM")
                 .map(PathBuf::from)
                 .unwrap_or_else(|_| home.join("Pictures/Lightroom")),
