@@ -424,6 +424,7 @@ pub fn verify_local_synced(local: &Path, remote: &str) -> Result<bool> {
             "--one-way",
             "--exclude", "shoot.json",
             "--exclude", "previews/**",
+            "--exclude", ".DS_Store",
         ])
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
@@ -454,6 +455,7 @@ pub fn verify_remote_synced(src: &str, dst: &str) -> Result<bool> {
             dst,
             "--one-way",
             "--exclude", "previews/**",
+            "--exclude", ".DS_Store",
         ])
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
